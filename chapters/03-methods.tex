@@ -1,0 +1,793 @@
+\chapter{从数学到算法：扩散与流的设计谱系}
+\label{ch:methods}
+
+\readingguide{第二章给出了分布演化的语言，本章把它变成可以训练、可以采样、可以比较的算法。阅读时请始终追问四件事：选了什么概率路径，网络预测什么，怎样走完生成路径，网络用什么结构。前两件决定学习任务，第三件决定数值误差与速度，第四件决定表达能力和计算成本。把四件事分开，许多看似互相取代的方法就会成为可以组合的部件。}
+
+\section{先画地图：方法名称为什么容易让人混淆}
+\label{sec:m-method-map}
+
+当我们说“用 DDPM 生成图片”，可能同时指一个逐步加噪的概率模型、一种噪声回归损失、一个高斯反向采样器，甚至默认了一套 U-Net。这些部件在最初的实现中一起出现，却没有数学理由要求它们永远绑在一起。同一个噪声预测网络可以用 DDPM、DDIM 或合适的 ODE 求解器采样；同一种 Flow Matching 损失也可以配合卷积网络或者 Transformer。要理解发展谱系，先拆掉名称造成的捆绑。
+
+\begin{table}[htbp]
+\centering
+\caption{阅读生成方法时的四个独立问题。例子表示选择，不表示互斥的版本。}
+\label{tab:m-four-axes}
+\small
+\begin{tabularx}{\linewidth}{p{0.13\linewidth}XX}
+\toprule
+设计维度 & 真正需要回答的问题 & 常见选择及影响\\
+\midrule
+概率路径 & 中间分布如何连接数据与噪声？ & VP、VE、高斯插值、直线插值；影响信噪比与运输几何\\
+监督目标 & 网络输出哪个数学量？ & 噪声、数据、score、$v$、速度、端点；影响数值尺度与损失权重\\
+采样算法 & 从起点怎样到达终点？ & 祖先采样、DDIM、Euler、Heun、DPM-Solver；影响离散误差与网络调用数\\
+网络结构 & 用什么函数族表示输出？ & U-Net、DiT、多模态 Transformer；影响容量、归纳偏置与成本\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+第二章的统一线索是：已知的条件扰动产生训练样本，条件回归的最优解给出边缘分布所需的场，采样器再利用这个场移动样本。算法的差异来自在哪一环改变了设计。DDPM 把链式概率模型和去噪回归连起来；DDIM 改变跨时刻的联合构造；Score SDE 用连续时间统一随机与确定性生成；EDM 整理尺度和数值选择；Flow Matching 直接学习运输速度；蒸馏则把一段昂贵的运动压缩成较少的网络调用。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small,
+  every node/.style={align=center},
+  component/.style={draw=black!45,rounded corners,fill=black!3,
+    minimum width=3.1cm,minimum height=0.85cm},
+  >=stealth]
+\node[component] (path) at (0,0) {概率路径\\$p_t$ 或 $p_\tau$};
+\node[component] (target) at (4.4,0) {条件回归\\$\eps_\theta,s_\theta,u_\theta$};
+\node[component] (sample) at (8.8,0) {生成算法\\SDE、ODE、端点映射};
+\node[component] (net) at (4.4,-1.7) {函数表示\\U-Net、Transformer};
+\draw[->] (path) -- node[above=5mm]{定义样本与标签} (target);
+\draw[->] (target) -- node[above=5mm]{提供场或映射} (sample);
+\draw[->] (net) -- node[right]{承载参数 $\theta$} (target);
+\node at (0,-1.7) {DDIM：改变联合构造\\EDM：整理尺度与调度};
+\node at (8.8,-1.7) {求解器：减少数值误差\\蒸馏：学习有限步结果};
+\end{tikzpicture}
+\caption{本章的原创方法地图。网络结构位于函数表示层，不能与采样器排在同一条替代链上。}
+\label{fig:m-map}
+\end{figure}
+
+下面采用全书约定：离散时刻 $k$ 从数据 $x_0$ 走向噪声 $x_K$；连续扩散时间 $t$ 也从数据走向噪声，生成时让 $t$ 下降；流时间 $\tau$ 从噪声走向数据，生成时让 $\tau$ 上升。改变时钟并不自动改变路径，改变路径也不等于只把时钟反过来。
+
+\section{DDPM：把反向高斯链变成监督学习}
+\label{sec:m-ddpm}
+
+\subsection{训练并不需要模拟整条加噪链}
+
+DDPM 的实用突破，是把复杂的反向分布学习转换为一个容易造标签的任务：给网络一张含噪样本及其噪声级别，请它预测加入的噪声。原论文以变分模型为起点，并展示了去噪目标与高质量图像生成的联系。\cite{r_ddpm}
+
+回顾式~\eqref{eq:forward-marginal}，令
+\[
+ a_k=\sqrt{\bar\alpha_k},\qquad b_k=\sqrt{1-\bar\alpha_k},
+ \qquad x_k=a_kx_0+b_k\eps,\quad \eps\sim\N(0,I).
+\]
+这里 $a_k,b_k$ 是便于本章讨论的缩写，不改变第二章符号。由于边缘分布可以直接采样，一次训练只需随机选择一个 $k$，无需先计算 $x_1,x_2,\ldots,x_{k-1}$。网络输入的时间必须与 $a_k,b_k$ 对应，否则同一个含噪向量无法让网络判断“应去除多少噪声”。
+
+\begin{examplebox}{DDPM 的一轮训练}
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item 从数据集中抽取 $x_0$；从 $\{1,\ldots,K\}$ 抽取 $k$；抽取独立的 $\eps\sim\N(0,I)$。
+\item 直接构造 $x_k=a_kx_0+b_k\eps$。
+\item 计算预测 $e=\eps_\theta(x_k,k,c)$；无条件模型省略条件 $c$。
+\item 计算 $\ell=\norm{e-\eps}^2$，对 $\theta$ 求梯度并更新。
+\end{enumerate}
+批处理时，每个样本可以拥有自己的 $k$。网络共享参数，时间嵌入把不同噪声级别的任务区分开。
+\end{examplebox}
+
+随机的噪声标签并不意味着学习没有方向。固定 $x_k=x$ 后，平方损失的最优预测为
+\begin{equation}
+\eps^*(x,k)=\E[\eps\mid x_k=x].
+\label{eq:m-noise-conditional}
+\end{equation}
+这正是第二章条件回归原理的应用。网络不会知道此次加噪使用的真实 $x_0$；它学到的是所有可能解释中由数据分布决定的条件平均。这个平均噪声可转换成 score，并指示哪些移动能把当前样本推向更高的含噪数据密度。不要把训练标签的可见性误解为生成阶段也能获得原图。
+
+\subsection{预测噪声怎样变成一步生成}
+
+由噪声预测可先计算一个数据估计
+\begin{equation}
+\widehat x_0(x_k,k)=\frac{x_k-b_k\eps_\theta(x_k,k)}{a_k}.
+\label{eq:m-x0-est}
+\end{equation}
+将它代入式~\eqref{eq:posterior} 的后验均值，就得到常用反向均值
+\begin{equation}
+\mu_\theta(x_k,k)=\frac{1}{\sqrt{\alpha_k}}
+\left(x_k-\frac{\beta_k}{b_k}\eps_\theta(x_k,k)\right).
+\label{eq:m-ddpm-mean}
+\end{equation}
+采样器选择反向方差 $\sigma_k^2$，执行
+\begin{equation}
+x_{k-1}=\mu_\theta(x_k,k)+\sigma_k z_k,\qquad
+z_k\sim\N(0,I).
+\label{eq:m-ddpm-step}
+\end{equation}
+一般展示图像时，最后一步可使用均值输出，令 $z_1=0$；若讨论离散像素的精确似然，则要另外指定末端观测分布，不能以这条展示规则替代。
+
+式~\eqref{eq:m-ddpm-step} 叫\emph{祖先采样}，意思是先从最上层噪声变量采样，再按照模型条件分布逐层采样后代。这一名称与祖先的时间先后没有关系。开始时取 $x_K\sim\N(0,I)$，要求 $A_K=\bar\alpha_K$ 足够小，使真实终端边缘接近这一先验；然后按 $k=K,\ldots,1$ 循环调用网络。输入已经没有原图，但每一步仍可以计算 $\mu_\theta$，这就是训练任务与生成任务接上的地方。
+
+\begin{derivationbox}{后验均值为什么能用数据估计替换}
+对 $k>1$，后验均值可写为
+\[
+ \widetilde\mu_k(x_k,x_0)
+ =\frac{a_{k-1}\beta_k}{1-\bar\alpha_k}x_0
+ +\frac{\sqrt{\alpha_k}(1-\bar\alpha_{k-1})}{1-\bar\alpha_k}x_k.
+\]
+它对 $x_0$ 是线性的，所以取条件期望时
+\[
+ \E[\widetilde\mu_k(x_k,x_0)\mid x_k]
+ =\widetilde\mu_k(x_k,\E[x_0\mid x_k]).
+\]
+因此理想回归给出了真实反向条件分布的均值。但真实
+$q(x_{k-1}\mid x_k)$ 还混合了不同 $x_0$ 的不确定性，一般并非一个精确高斯。均值正确不等于整个有限步反向分布都正确。
+\end{derivationbox}
+
+这也解释了“小步”的作用。用许多小噪声步，单步反向分布更容易用高斯近似。将 1000 步链随意删成 10 步，再沿用原来的单步 $\beta_k$，会使均值和方差不再对应新的跨度。正确的跨步祖先采样必须重新计算有效噪声参数，例如从 $k$ 跨到 $j<k$ 时，前向缩放比是 $a_k/a_j$，有效方差是 $1-a_k^2/a_j^2$。DDIM 与 ODE 求解器则提供了另一类跨步规则。
+
+\subsection{实现前必须核对的尺度}
+
+“噪声预测的损失接近 1”不是普遍的健康标准。损失是按维度求和还是求平均，数据值域是 $[0,1]$ 还是 $[-1,1]$，潜变量是否乘了缩放因子，都会改变数值。可操作的核对是：先计算恒为零的预测器的平均噪声均方误差，再比较训练模型能否显著降低它；按 $k$ 分组观察，避免容易的时刻掩盖困难的时刻。
+
+另一个值得注意的现象是，式~\eqref{eq:m-x0-est} 在 $a_k$ 很小时会放大噪声预测误差。设预测误差为 $\delta e$，就有
+\[
+ \delta\widehat x_0=-\frac{b_k}{a_k}\delta e.
+\]
+高噪声区从 $\eps$ 转换到数据会病态；低噪声区从数据转换到 score 也可能病态。模型的输出参数化需要考虑这些尺度，而不是只比较输出名字。
+
+\section{DDIM：保留单时刻训练，重新安排跨时刻运动}
+\label{sec:m-ddim}
+
+\subsection{相同边缘分布可以有不同联合分布}
+
+DDPM 的去噪损失只需要 $(x_0,x_k)$ 的分布，它没有直接询问 $x_k$ 和 $x_j$ 在同一条随机路径中怎样相关。DDIM 利用这个自由度构造一族非马尔可夫的前向联合分布，保留 $q(x_k\mid x_0)$，并据此设计更短的生成过程。\cite{m_ddim}
+
+用 $A_k=\bar\alpha_k$ 暂时简化公式，选定两个时刻 $j<k$，规定
+\begin{align}
+q_\sigma(x_j\mid x_k,x_0)
+ &=\N\bigl(m_{j\mid k}(x_k,x_0),\,\sigma_{k\to j}^2I\bigr),\\
+m_{j\mid k}(x_k,x_0)
+ &=\sqrt{A_j}x_0
+ +\sqrt{1-A_j-\sigma_{k\to j}^2}\,
+ \frac{x_k-\sqrt{A_k}x_0}{\sqrt{1-A_k}}.
+\label{eq:m-ddim-conditional}
+\end{align}
+要求 $0\leq\sigma_{k\to j}^2\leq1-A_j$。给定 $x_0$，分式中的残差服从标准正态；再加独立噪声后，$x_j$ 的总条件方差为
+\[
+ (1-A_j-\sigma_{k\to j}^2)+\sigma_{k\to j}^2=1-A_j,
+\]
+均值仍是 $\sqrt{A_j}x_0$。从较大时刻向较小时刻递归，就能保持所需的每个边缘分布。
+
+保持这些边缘，意味着可以继续使用相同的去噪样本和标签，不意味着不同联合构造的完整变分目标数值完全相等。相应变分目标会得到不同的时刻权重；若允许每个时刻拥有充分表达能力，正权重不改变各自的理想条件回归解。实际网络共享参数且容量有限，权重仍会影响优化。DDIM 复用 DDPM 的常用去噪代理目标，应在这个意义下理解“相同训练”。
+
+这里的“非马尔可夫”指所设计的前向推断联合分布：它依赖 $x_0$，不再仅由上一时刻决定。实际生成时用模型估计替换 $x_0$ 后，更新仍可以只依赖当前状态与时刻。两句话讨论不同的联合分布，不能据“非马尔可夫”断言生成代码必须保存所有历史图像。
+
+\subsection{三项更新各自做什么}
+
+令 $e_k=\eps_\theta(x_k,k)$，用式~\eqref{eq:m-x0-est} 得到 $\widehat x_0$，式~\eqref{eq:m-ddim-conditional} 给出
+\begin{equation}
+x_j=\sqrt{A_j}\widehat x_0
+ +\sqrt{1-A_j-\sigma_{k\to j}^2}\,e_k
+ +\sigma_{k\to j}z,\qquad z\sim\N(0,I).
+\label{eq:m-ddim-step}
+\end{equation}
+第一项保留当前预测的数据成分，第二项保留一部分已估计的噪声方向，第三项引入新的随机性。这样看，采样器是在重新分配数据、已有噪声和新噪声的比例，而不是简单“少做几次去噪”。
+
+常用选择是
+\begin{equation}
+\sigma_{k\to j}=
+\eta\sqrt{\frac{1-A_j}{1-A_k}}
+\sqrt{1-\frac{A_k}{A_j}},\qquad 0\leq\eta\leq1.
+\label{eq:m-ddim-eta}
+\end{equation}
+$\eta=0$ 时，给定起点和条件，整个采样过程是确定性的；$\eta=1$ 对应所选跨度的后验方差。在相邻步及相应均值、方差选择下，它恢复 DDPM 的一种祖先采样形式；不能因此说它恢复所有采用不同反向方差的 DDPM 实现。对于 $j=0$，$A_0=1$，更新退化为输出数据估计。
+
+确定性不妨碍生成多样性。每次从不同 $x_K$ 开始，就会得到不同输出。它只是去掉了路径中的额外随机数，因此同一随机起点更容易在不同步数的采样结果中保持相关语义。这个性质适合编辑与比较实验，但不保证任意改动采样网格后图像完全一致。
+
+\begin{examplebox}{跨步 DDIM 的采样流程}
+选定严格递减网格 $k_M=K>k_{M-1}>\cdots>k_0=0$，从
+$x_{k_M}\sim\N(0,I)$ 开始。对 $i=M,\ldots,1$：
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item 令 $k=k_i,\ j=k_{i-1}$，在原训练时刻 $k$ 计算 $e_k$。
+\item 从原训练噪声表取得 $A_k,A_j$，计算 $\widehat x_0$。
+\item 用式~\eqref{eq:m-ddim-eta} 计算跨度方差，再用式~\eqref{eq:m-ddim-step} 更新。
+\end{enumerate}
+训练时刻仍使用原来的索引；不能把第 $i$ 次网络调用直接当作第 $i$ 个训练时刻。
+\end{examplebox}
+
+\subsection{DDIM 与概率流 ODE：关系需要一个条件}
+
+确定性 DDIM 确实与概率流 ODE 有紧密关系，但“DDIM 就是任意一步的精确概率流解”会造成误解。看清它的数值坐标即可消除这个混淆。令
+\[
+ r(t)=\frac{b(t)}{a(t)},\qquad y(t)=\frac{x_t}{a(t)}.
+\]
+在相应高斯扩散路径和噪声预测转换下，概率流 ODE 可以写成
+\begin{equation}
+\frac{\dd y}{\dd r}=\eps_\theta(a(t)y,t).
+\label{eq:m-ddim-rescaled-ode}
+\end{equation}
+确定性 DDIM 的更新恰好是
+\[
+ y_j=y_k+(r_j-r_k)\eps_\theta(x_k,k),
+\]
+即在缩放状态 $y$、噪声比 $r$ 坐标中冻结当前噪声预测的一阶更新。连续极限对应同一类概率流方程；有限步时，沿轨迹的网络输出会变化，冻结它就产生离散误差。原始时间 $t$ 中的朴素 Euler 更新与这个坐标变换后的更新也一般不同。
+
+\begin{cautionbox}{边缘一致性不等于有限步精确生成}
+DDIM 构造保证的是已知真实 $x_0$ 时前向条件边缘的正确性。生成时用条件平均预测替换 $x_0$，再跨越有限时间，既有函数近似误差，也有有限步运动误差。即使回归网络理想，粗网格也不能自动获得任意数据分布的精确样本。概率流 ODE 的同边缘结论还需要真实 score 与准确积分。
+\end{cautionbox}
+
+一个简单反例是全步跳到数据端：$j=0$ 时输出 $\E[x_0\mid x_K]$。如果 $x_K$ 几乎与数据独立，这个条件平均趋近数据均值；它当然不是完整的数据分布。理解这一点，也就理解了为什么“标签为噪声，误差很小”仍不足以支持一步生成。
+
+\section{Score SDE：同一个 score 支持随机和确定性采样}
+\label{sec:m-score-sde}
+
+Score SDE 的贡献是把离散去噪链与多噪声级别 score 模型放在连续随机过程框架中，并给出反向 SDE、预测器--校正器和概率流 ODE 的统一关系。\cite{r_sde} 数学关系已在第~\ref{ch:math}~章推导，本节只讨论如何落实。
+
+以标量扩散系数的前向过程
+\[
+ \dd x_t=f(x_t,t)\dd t+g(t)\dd W_t
+\]
+为例。设 $h>0$，从当前扩散时刻 $t$ 生成到 $t-h$。反向 SDE 的 Euler--Maruyama 预测步为
+\begin{equation}
+x^- = x_t-\bigl[f(x_t,t)-g(t)^2s_\theta(x_t,t)\bigr]h
+      +g(t)\sqrt h\,z,\qquad z\sim\N(0,I).
+\label{eq:m-em}
+\end{equation}
+公式中的负号来自时间下降，噪声方差仍为 $g(t)^2h$。直接把 $h$ 换成负数放进平方根，是常见的反向时间错误。\term{布朗运动}{gl:brownian}的增量依赖经过的正时间长度，而不是依赖时刻标签的符号。
+
+到达新时刻后，可以固定这个噪声级别，做若干 Langevin 校正：
+\begin{equation}
+x\leftarrow x+\delta\,s_\theta(x,t-h)+\sqrt{2\delta}\,z'.
+\label{eq:m-langevin}
+\end{equation}
+预测器负责沿时间演化，校正器尝试改善当前时刻的分布匹配。若 score 真实、步长适当、校正充分，Langevin 动力学以该时刻分布为平稳分布。有限次大步校正并不具有这个精确保证；额外调用网络也会增加代价。
+
+因此，PC 采样适合从“演化”和“局部分布修正”两个角度理解。它不是对图像反复锐化，也不是每步都必须有校正。概率流 ODE 则用
+$f-\frac12g^2s_\theta$ 作确定性漂移，在相同 score 理想条件下具有相同的单时刻边缘。SDE 保留路径随机性，ODE 可做确定性运输和连续流似然计算，二者的有限步效果取决于模型误差与数值方法，不能只凭“随机”或“确定”宣布优劣。
+
+VP 和 VE 的区别也应放在路径轴上理解。VP 让数据系数下降、噪声系数增加，标准形式满足 $a(t)^2+b(t)^2=1$；VE 保持数据系数为 1，增加噪声标准差，因此样本方差变大。VP 适合直接连接标准化数据与近似标准高斯，VE 的加性噪声坐标便于讨论去噪器和噪声尺度。换路径后必须重新检查网络输入尺度与 score 转换，不能只替换采样器名称。
+
+\section{Improved DDPM 与 EDM：让学习和数值尺度配合}
+\label{sec:m-design}
+
+\subsection{Improved DDPM：噪声日程与反向方差也是模型设计}
+
+Improved DDPM 展示了噪声日程、学习反向方差和目标权重对生成质量、似然及采样效率的作用。\cite{m_improved} 这些改动没有要求抛弃 DDPM 的基本回归思想。
+
+首先，逐步线性增加 $\beta_k$ 不代表信息逐步线性减少。噪声日程最好在累积量 $A_k$ 或\term{信噪比}{gl:snr}上检查，因为信号强度是多个缩放系数的乘积。一个常见余弦日程写成
+\[
+ A_k=\frac{F(k/K)}{F(0)},\qquad
+ F(u)=\cos^2\left(\frac{u+s}{1+s}\frac{\pi}{2}\right),
+\]
+再由 $\beta_k=1-A_k/A_{k-1}$ 得到单步噪声。实际末端通常还要裁剪 $\beta_k$，避免奇异值。其意义是把信息变化安排得更平缓，让较多训练时刻保持有用信号；余弦函数并不是所有数据和所有路径上的普遍最优定律。
+
+其次，反向方差可以由网络学习。对 $k>1$，已知后验方差
+\[
+ \widetilde\beta_k=
+ \beta_k\frac{1-A_{k-1}}{1-A_k}.
+\]
+可将网络给出的插值量 $\rho_\theta$ 放入对数方差
+\[
+ \log \Sigma_\theta=
+ \rho_\theta\log\beta_k+
+ (1-\rho_\theta)\log\widetilde\beta_k,
+\]
+逐维应用以形成对角协方差。末端 $\widetilde\beta_1=0$ 必须专门处理。学习方差的动机是补充均值之外的反向不确定性，但仅靠噪声均方误差无法训练这一输出，需要变分目标或其混合形式。
+
+混合目标可抽象写为
+$L_{\mathrm{simple}}+\lambda L_{\mathrm{VLB}}$。这里 $L_{\mathrm{simple}}$
+强调去噪回归，变分项补充方差与似然信息。某些实现对变分项中的均值分支停止梯度，以减少两个目标对均值学习的竞争；停止梯度是优化选择，不能说它仍在对完整原目标做同样的梯度下降。
+
+若随机抽时刻的分布为 $q_k$，想无偏估计
+$\frac1K\sum_k L_k$，需用 $L_k/(Kq_k)$。改变抽样概率和改变目标权重是两件事。前者配合正确的重要性权重可以降低估计方差；若不补偿，训练的目标本身已经变化。工程中二者都可能有用，但报告实验时应说明采用哪一种。
+
+\subsection{EDM：把噪声标准差当作清楚的物理量}
+
+EDM 系统拆分采样日程、数值积分、网络预条件和训练噪声选择，强调不同设计可以分别改进和组合。\cite{m_edm} 本节用其常用加性噪声坐标解释：设
+\[
+ x_\sigma=X+\sigma\eps,\qquad
+ D_\theta(x,\sigma)\approx\E[X\mid x_\sigma=x].
+\]
+$\sigma$ 表示每个维度的噪声标准差，生成时从较大的 $\sigma$ 走向 0。此处 $\sigma$ 是噪声坐标，连续扩散 $t$ 的方向约定仍然不变。由去噪与 score 的关系
+\[
+ s_\theta(x,\sigma)=\frac{D_\theta(x,\sigma)-x}{\sigma^2},
+\]
+相应确定性 ODE 在这个坐标中为
+\begin{equation}
+\frac{\dd x}{\dd\sigma}
+=\frac{x-D_\theta(x,\sigma)}{\sigma}.
+\label{eq:m-edm-ode}
+\end{equation}
+可以把它理解为：含噪样本与当前数据估计的差值，按照当前噪声尺度转换成运动方向。降 $\sigma$ 时步长为负，因此会朝去噪估计移动。
+
+问题在于 $\sigma$ 可能跨越多个数量级。若直接把所有 $x_\sigma$ 输入同一个网络，高噪声输入幅度大、低噪声残差小，网络要同时处理完全不同的尺度。预条件把已知的尺度变化放到解析系数中：
+\begin{equation}
+D_\theta(x,\sigma)=c_{\mathrm{skip}}(\sigma)x+
+c_{\mathrm{out}}(\sigma)
+F_\theta(c_{\mathrm{in}}(\sigma)x,c_{\mathrm{noise}}(\sigma)).
+\label{eq:m-edm-precond}
+\end{equation}
+设数据标准差的代表尺度为 $\sigma_{\mathrm{data}}$，一种常用选择为
+\begin{align}
+c_{\mathrm{in}}&=(\sigma^2+\sigma_{\mathrm{data}}^2)^{-1/2},
+&
+c_{\mathrm{skip}}&=\frac{\sigma_{\mathrm{data}}^2}
+{\sigma^2+\sigma_{\mathrm{data}}^2},\\
+c_{\mathrm{out}}&=\frac{\sigma\sigma_{\mathrm{data}}}
+{\sqrt{\sigma^2+\sigma_{\mathrm{data}}^2}},
+&
+c_{\mathrm{noise}}&=\tfrac14\log\sigma.
+\end{align}
+输入归一化让网络看到的幅度更稳定；跳连在低噪声区保留输入；输出系数让网络主要拟合尺度适当的残差。这些解析系数并不让一般数据分布的去噪器变成线性函数，而是减轻网络不必要的尺度负担。
+
+\begin{intuitionbox}{预条件像换一把合适的尺子}
+同一个温度预测问题，分别用摄氏度、毫摄氏度和绝对温标表示，并不会改变物理对象，却会改变数值优化。扩散的不同噪声时刻也有类似问题。预条件利用已知的噪声尺度调整输入和输出，让网络把容量花在数据结构上。
+\end{intuitionbox}
+
+相应损失常写为
+\[
+ \E_{\sigma,X,\eps}
+ \left[w(\sigma)\norm{D_\theta(X+\sigma\eps,\sigma)-X}^2\right],
+ \qquad
+ w(\sigma)=\frac{\sigma^2+\sigma_{\mathrm{data}}^2}
+ {(\sigma\sigma_{\mathrm{data}})^2}.
+\]
+这个权重等于 $c_{\mathrm{out}}^{-2}$，配合重写后的网络残差目标，使不同噪声级别更容易取得相近尺度。噪声抽样常在 $\log\sigma$ 空间安排，以覆盖多个数量级；具体分布仍需和数据、网络以及采样区间匹配。
+
+数值方面，给出 $N$ 个正噪声节点
+\[
+ \sigma_i=\left[
+ \sigma_{\max}^{1/\rho}
+ +\frac{i}{N-1}\left(\sigma_{\min}^{1/\rho}
+ -\sigma_{\max}^{1/\rho}\right)\right]^\rho,
+ \qquad i=0,\ldots,N-1,
+\]
+再附加 $\sigma_N=0$。它在变换坐标中均匀取点，以把节点集中到需要精细分辨的噪声区。常见的 $\rho$ 数值是经验选择，不应脱离模型一律使用。生成通常从 $x_{\sigma_{\max}}=\sigma_{\max}z$、$z\sim\N(0,I)$ 开始；这是大噪声端的近似先验，其有效性也依赖噪声尺度足以盖过数据尺度。
+
+记 $d_i=(x_i-D_\theta(x_i,\sigma_i))/\sigma_i$，
+一步 Euler 先得到 $x'=x_i+(\sigma_{i+1}-\sigma_i)d_i$。
+若 $\sigma_{i+1}>0$，再计算
+$d'=(x'-D_\theta(x',\sigma_{i+1}))/\sigma_{i+1}$，用 Heun 更新
+\begin{equation}
+x_{i+1}=x_i+\frac{\sigma_{i+1}-\sigma_i}{2}(d_i+d').
+\label{eq:m-heun}
+\end{equation}
+最后到 0 的一步可只用 Euler，避免除以 0。EDM 还讨论可控地增加噪声再继续生成的随机采样选择；解析 ODE、网络预条件和随机修正是不同部件，使用其中一个不代表必须同时使用全部。
+
+\section{输出参数化：噪声、数据、score 和 \texorpdfstring{$v$}{v}}
+\label{sec:m-parameterization}
+
+第二章已经给出了参数化转换。本节强调它们在训练中的差异。固定 $t$，设 $x_t=aX+b\eps$，$a,b>0$。如果一个估计器给出 $\widehat\eps$，就可以得到
+$\widehat X=(x_t-b\widehat\eps)/a$ 和
+$\widehat s=-\widehat\eps/b$。反向也成立。对于无限容量、精确回归与相应权重，很多表示可描述同一个理想场；对于有限网络、有限计算与未调整的损失，它们不再等价。
+
+\begin{table}[htbp]
+\centering
+\caption{相同含噪样本的几种输出。表中的误差关系按兼容的线性转换计算。}
+\label{tab:m-targets}
+\small
+\begin{tabularx}{\linewidth}{p{0.12\linewidth}XX}
+\toprule
+输出 & 训练标签及理想含义 & 尺度提醒\\
+\midrule
+噪声 & $\eps$；最优为 $\E[\eps\mid x_t]$ & 数据误差为 $-(b/a)\delta\eps$，高噪声区放大\\
+数据 & $X$；最优为 $\E[X\mid x_t]$ & 噪声误差为 $-(a/b)\delta X$，低噪声区放大\\
+score & 条件标签 $-\eps/b$；最优为 $s_t$ & 小 $b$ 时标签幅度大，常需权重或尺度化\\
+$v$ & $a\eps-bX$，限 $a^2+b^2=1$ & 旋转坐标稳定转换；与 ODE 速度需另作区别\\
+流速度 & $\dot\gamma_0 Z+\dot\gamma_1 X$，系数按流路径定义 & 时间重参数化直接改变速度和权重\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+表中的 $\gamma_0,\gamma_1$ 是流路径的噪声系数和数据系数，将在第~\ref{sec:m-flow}~节定义；它们不自动等于连续扩散的 $a,b$。
+
+例如，兼容估计器满足
+\[
+\norm{\widehat\eps-\eps}^2
+=\frac{a^2}{b^2}\norm{\widehat X-X}^2.
+\]
+所以“均匀时刻下的无权重噪声损失”在数据预测坐标中，是按信噪比
+$a^2/b^2$ 加权的损失。换目标却保持表面上同一个均方误差，实际上改变了训练关注的噪声区域。
+
+在 VP 路径中，$v$ 的几何尤其清楚。写
+$a=\cos\phi,\ b=\sin\phi$，就有
+\begin{equation}
+\begin{pmatrix}x_t\\v\end{pmatrix}
+=
+\begin{pmatrix}a&b\\-b&a\end{pmatrix}
+\begin{pmatrix}X\\\eps\end{pmatrix},
+\qquad
+X=ax_t-bv,\quad\eps=bx_t+av.
+\label{eq:m-v-rotation}
+\end{equation}
+这是正交旋转，逆变换没有 $1/a$ 或 $1/b$，因而在两端更稳定。
+$v$ 预测在渐进蒸馏等工作中发挥了作用。\cite{r_vpred}
+若固定一对 $(X,\eps)$，其插值轨迹对角度的导数正是
+$\dd x/\dd\phi=v$。但对扩散时间的导数为
+$\dd x/\dd t=\phi'(t)v$；网络给出条件平均时，对应的是该路径的边缘速度。只有连同路径、时钟和条件平均一起说明，才可以把 $v$ 与速度场联系起来。不同系数的 Flow Matching 速度不能直接套用式~\eqref{eq:m-v-rotation}。
+
+对同一 $x_t$，兼容的 $v$ 与数据误差还有
+$\delta X=-b\,\delta v$，所以无权重 $v$ 损失对应数据误差权重
+$1/b^2$。这使它与噪声预测的信噪比权重不同。参数化是改善数值和优化的工具，不是凭命名保证更好生成的魔法。
+
+\section{ODE 加速：把已知线性部分解析地走完}
+\label{sec:m-solvers}
+
+\subsection{为何更多阶数未必意味着更快}
+
+使用第~\ref{sec:pfode}~节的概率流 ODE 后，采样变成数值积分问题。网络每次给出向量场的估计，求解器将其转成一段有限运动。Euler 用起点斜率，Heun 用预测终点的斜率修正，其他 Runge--Kutta 方法再利用中间点。高阶方法在足够光滑、步长足够小时可以更快降低误差，但每步往往需要更多网络调用。
+
+因此评价时应区分采样步数与\emph{网络函数评估次数}（NFE）。一个 20 步 Heun 求解器可能接近调用网络 40 次；一个多步法可复用历史输出，每个新步只增加一次调用。文本条件生成中的\term{无分类器引导}{gl:cfg}还可能需要有条件和无条件两路网络计算：即使合并到一个批次，实际计算量也不凭批次数自动减半。延迟、吞吐量、显存和 NFE 各回答不同问题。
+
+同样重要的是模型误差。记真实场为 $w$，网络场为 $w_\theta$，它们之差是学习误差；求解器对 $w_\theta$ 的误差是离散误差。无限增加步数最多精确求解网络给出的方程，不能自动修复网络场。反过来，一个更好的网络若只用极粗网格，也可能因数值误差失去优势。
+
+\subsection{DPM-Solver 的基本积分恒等式}
+
+DPM-Solver 利用扩散 ODE 的半线性结构：先解析处理已知缩放项，再对网络相关的积分做高阶近似。\cite{m_dpmsolver} 这与把整条方程当作黑箱的通用求解器是不同的利用信息方式。
+
+对高斯路径 $x_t=a(t)X+b(t)\eps$，设前向漂移
+$f(t)x$，其中 $f=a'/a$，扩散方差率
+$g^2=(b^2)'-2fb^2$。噪声预测形式的概率流 ODE 为
+\begin{equation}
+\frac{\dd x}{\dd t}
+=f(t)x+\frac{g(t)^2}{2b(t)}\eps_\theta(x,t)
+=\frac{a'}{a}x+\left(b'-\frac{a'}{a}b\right)\eps_\theta(x,t).
+\label{eq:m-semilinear}
+\end{equation}
+除以 $a$，已知线性项恰好抵消：
+\[
+ \frac{\dd(x/a)}{\dd t}
+ =\frac{\dd(b/a)}{\dd t}\eps_\theta(x,t).
+\]
+这已经给出式~\eqref{eq:m-ddim-rescaled-ode}。再令
+\[
+ \lambda(t)=\log\frac{a(t)}{b(t)}
+ =\tfrac12\log\operatorname{SNR}(t),
+\]
+注意本节 $\lambda$ 是半对数信噪比，文献有时将完整对数信噪比也记为同一字母。因为 $b/a=e^{-\lambda}$，从较高噪声的时刻 $t$ 生成到较低噪声的 $s<t$，有
+\begin{equation}
+x_s=\frac{a(s)}{a(t)}x_t
+-a(s)\int_{\lambda(t)}^{\lambda(s)}
+e^{-\lambda}\eps_\theta(x(\lambda),t(\lambda))\dd\lambda.
+\label{eq:m-dpm-exact}
+\end{equation}
+这是学习 ODE 的精确解恒等式，不是假定网络不变。难点只剩被积函数沿轨迹如何变化。
+
+令 $h=\lambda(s)-\lambda(t)>0$，如果把积分中的网络输出冻结为当前值 $e_t$，就得到
+\begin{equation}
+x_s\approx\frac{a(s)}{a(t)}x_t
+-b(s)(e^h-1)e_t.
+\label{eq:m-dpm-first}
+\end{equation}
+这与相应确定性 DDIM 更新代数等价。它给出了 DDIM 的一阶积分视角，也说明“解析处理线性项”不等于“整个 ODE 已经解析解出”。更高阶求解器通过额外时刻的预测或历史输出估计网络变化，再把指数权重下的多项式项积分掉。
+
+\begin{derivationbox}{数据预测形式的积分也可以解析整理}
+令 $D_\theta=(x-b\eps_\theta)/a$，式~\eqref{eq:m-semilinear} 可重写为
+\[
+ \frac{\dd x}{\dd t}
+ =\frac{b'}b x+a\lambda'(t)D_\theta(x,t).
+\]
+于是
+\[
+ \frac{\dd(x/b)}{\dd\lambda}
+ =e^\lambda D_\theta(x(\lambda),t(\lambda)),
+\]
+从而
+\[
+ x_s=\frac{b(s)}{b(t)}x_t+
+ b(s)\int_{\lambda(t)}^{\lambda(s)}
+ e^\lambda D_\theta(x(\lambda),t(\lambda))\dd\lambda.
+\]
+冻结数据预测得到
+$x_s\approx\frac{b(s)}{b(t)}x_t+
+a(s)(1-e^{-h})D_\theta(x_t,t)$。
+一阶时它与式~\eqref{eq:m-dpm-first} 等价；高阶时，对噪声预测和数据预测分别近似，可能具有不同的稳定性。
+\end{derivationbox}
+
+DPM-Solver++ 用数据预测形式组织高阶积分，并针对引导采样提出稳定性改进与多步变体。\cite{m_dpmsolverpp} 其价值可从上面的两种积分理解：两者在连续方程上等价，却把非线性变化交给不同的被积函数近似。大引导会放大场的变化，更需要注意数值稳定性。
+
+选择求解器时，至少要检查模型输出如何转换、时间与噪声日程是否一致、起终点是否落在可用区间。理论表达中的 $a=0$、$b=0$ 会让 $\lambda$ 发散，实际通常在有限端点积分，再做终端去噪。若潜变量没有天然的 $[-1,1]$ 边界，随意套用像素空间的数据裁剪还会改变所解的场。低 NFE 场景应实测质量与稳定性，不能只按求解阶数选名称。
+
+\section{Flow Matching：直接学会把概率质量运过去}
+\label{sec:m-flow}
+
+\subsection{不必先制造随机扩散，才能训练生成 ODE}
+
+Flow Matching 的入口是连续运输。先选择一族容易抽样的条件概率路径，再回归其条件速度；条件回归得到边缘速度，生成时解 ODE。它兼容扩散型高斯路径，也允许其他路径。\cite{r_fm} 与第~\ref{sec:flowmatching}~节一样，本节用流时钟 $\tau$，从噪声端 0 走向数据端 1。
+
+最直观的训练方案是抽取 $Z\sim\pnoise$、$X\sim\pdata$，选择一对端点的\term{耦合}{gl:coupling}，构造
+\begin{equation}
+Y_\tau=(1-\tau)Z+\tau X,\qquad
+V=X-Z.
+\label{eq:m-linear-flow}
+\end{equation}
+然后最小化
+\begin{equation}
+L_{\mathrm{lin}}
+=\E_{\tau,Z,X}\norm{u_\theta(Y_\tau,\tau)-(X-Z)}^2.
+\label{eq:m-flow-loss}
+\end{equation}
+若端点独立，这叫独立耦合；若用某种配对规则产生端点，必须确保各自边缘仍是噪声和数据分布。耦合改变的是“哪些起点与哪些终点组成训练对”，它影响中间分布和速度回归难度。
+
+式~\eqref{eq:m-flow-loss} 没有要求训练阶段解 ODE，因此常称“无模拟训练”。这表示造训练样本和标签时不用模拟生成轨迹，不表示生成阶段不用积分，也不表示整个训练没有随机计算。
+
+\begin{examplebox}{直线 Flow Matching 的训练与生成}
+\textbf{训练：}抽 $(Z,X)$ 与 $\tau$，计算 $Y_\tau$，回归 $X-Z$，更新参数。
+
+\textbf{生成：}取 $y_0\sim\pnoise$，选网格
+$0=\tau_0<\cdots<\tau_N=1$，例如用 Euler：
+\[
+ y_{i+1}=y_i+(\tau_{i+1}-\tau_i)u_\theta(y_i,\tau_i).
+\]
+训练标签的 $X$ 只在训练阶段可用；生成阶段的运动完全由当前 $y_i$、时刻和条件决定。
+\end{examplebox}
+
+一般路径可以写为
+$Y_\tau=\gamma_0(\tau)Z+\gamma_1(\tau)X$，满足
+$\gamma_0(0)=1,\gamma_1(0)=0,\gamma_0(1)=0,\gamma_1(1)=1$，相应标签为
+$\dot\gamma_0Z+\dot\gamma_1X$。这说明 Flow Matching 首先是一套回归速度的训练原则，不是“所有方法都必须使用直线”的名称。
+
+\subsection{直线标签为什么可能学出弯曲的生成轨迹}
+
+每个训练对的路径确实是一条直线，但网络观察的是当前位置，不是端点对。最优网络为
+\begin{equation}
+u^*_\tau(y)=\E[X-Z\mid Y_\tau=y].
+\label{eq:m-flow-mean}
+\end{equation}
+在同一位置交汇的不同训练对可能有不同方向，网络给出条件平均方向。沿着这个边缘场走的 ODE 轨迹，通常不等于任何一个训练端点对的直线。它会随位置变化而弯曲，但在适当正则性与精确学习下仍运输所需边缘分布。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=0.95cm,y=0.85cm,font=\small,>=stealth]
+\draw[->] (-0.4,0)--(5.1,0) node[right]{$\tau$};
+\node[left] at (0,2.8){端点配对};
+\draw[black!30,dashed] (0,0.5)--(4.5,2.5);
+\draw[black!30,dashed] (0,2.5)--(4.5,0.5);
+\draw[black!30,dashed] (0,1.1)--(4.5,2.0);
+\draw[black!30,dashed] (0,2.0)--(4.5,1.1);
+\fill (0,0.5) circle(2pt);\fill (0,2.5) circle(2pt);
+\fill (4.5,2.5) circle(2pt);\fill (4.5,0.5) circle(2pt);
+\node[below] at (0,0){噪声};
+\node[below] at (4.5,0){数据};
+\node at (2.2,3.1){每对标签路径是直线};
+\begin{scope}[xshift=7.0cm]
+\draw[->] (-0.4,0)--(5.1,0) node[right]{$\tau$};
+\draw[thick,->] (0,0.5) .. controls (1.4,0.15) and (3.0,0.9) .. (4.5,0.5);
+\draw[thick,->] (0,2.5) .. controls (1.1,2.9) and (3.3,2.1) .. (4.5,2.5);
+\draw[thick,->] (0,1.1) .. controls (1.8,1.0) and (2.7,1.8) .. (4.5,2.0);
+\node[below] at (0,0){噪声};
+\node[below] at (4.5,0){数据};
+\node at (2.2,3.1){回归边缘场后的轨迹可弯曲};
+\end{scope}
+\end{tikzpicture}
+\caption{直线条件路径与边缘 ODE 轨迹的区别。此图为概念示意，曲线用于强调二者不应逐条等同，不代表特定分布的数值解。}
+\label{fig:m-flow-lines}
+\end{figure}
+
+用平方损失的分解还能看到耦合的重要性：
+\begin{align}
+&\E\norm{u_\theta(Y_\tau,\tau)-V}^2\\
+&\quad=\E\norm{u_\theta(Y_\tau,\tau)-u^*_\tau(Y_\tau)}^2
+ +\E\norm{V-u^*_\tau(Y_\tau)}^2.
+\end{align}
+第二项是当前位置无法分辨端点对造成的条件方差，固定耦合后它与网络参数无关。改善配对可减少冲突方向，也可能让运输更短；这是一条改变学习任务几何的路线，不是简单提高网络求解阶数。
+
+在噪声端与数据端，插值路径可能出现尖锐尺度变化；真实图像分布又往往接近低维结构。因此仍需关注端点截断、时间采样分布、潜空间缩放和网络正则性。抽样 $\tau$ 的密度偏向某区域而不补偿时，相当于给该区域增加训练权重。一个流模型可以使用很简单的 Euler，也可以使用高阶 ODE 求解器；直线标签不免除数值检验。
+
+\subsection{与扩散 ODE 的共同点和不同点}
+
+二者都可以生成一个随时间变化的确定性速度场，都可用神经网络和 ODE 求解器。扩散路径先给出带噪边缘，score 再转换为概率流速度；Flow Matching 直接回归条件速度。若选择相同高斯路径，正确转换并调整权重，二者可以对应同一边缘场。若选择不同路径或不同耦合，生成几何已经不同，不能称为只把“预测噪声”重命名成“预测速度”。
+
+尤其要记住 $\tau=1-t$ 只是时钟反向。对于某一固定路径，它把速度乘以负号；如果同时把 VP 三角系数换成 $(1-\tau,\tau)$，就连路径与信噪比日程都变了。把差异拆成“路径变化、时钟变化、输出变化、损失变化”，往往比争论哪个方法属于哪个家族更有用。
+
+\section{Rectified Flow：端点配对和 reflow 为什么有用}
+\label{sec:m-rectified}
+
+Rectified Flow 从连接两端样本的直线出发，回归速度并用所得 ODE 产生新的确定性端点耦合；重复这个过程称为 reflow。\cite{m_rectified} 它与直线条件 Flow Matching 的目标密切相连，强调的另一个核心是端点耦合怎样被逐次改变。
+
+第一轮可使用独立端点对 $(Z,X)$。训练得到 $u^{(1)}$ 后，从 $Z$ 积分生成
+$\widehat X=\Phi^{(1)}_{0\to1}(Z)$。这样产生新的训练对
+$(Z,\widehat X)$，两端有确定性关系。第二轮对新配对重新做直线插值和速度回归，得到 $u^{(2)}$。第一轮中的目标 $X$ 来自真实数据，第二轮的目标 $\widehat X$ 则来自模型生成；这一变化必须清楚记录。
+
+\begin{examplebox}{一轮 reflow 的操作顺序}
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item 冻结当前速度网络，抽取许多 $Z$，用足够精细的求解器生成对应端点 $\widehat X$。
+\item 保存配对关系 $(Z,\widehat X)$，条件生成时同时保存条件 $c$。
+\item 对这些新端点对随机抽 $\tau$，构造
+$(1-\tau)Z+\tau\widehat X$，回归标签 $\widehat X-Z$。
+\item 用新网络评估轨迹弯曲程度、低 NFE 质量和分布覆盖，再决定是否继续一轮。
+\end{enumerate}
+重新训练的是新耦合上的速度，不是直接把旧网络采样步数改成 1。
+\end{examplebox}
+
+为什么它可能缩短运输？考虑理想化情形：第一轮 ODE 的边缘与插值边缘一致，并满足使轨迹存在和唯一的条件。记其轨迹为 $Q_\tau$，则
+\[
+ Q_1-Q_0=\int_0^1u^*_\tau(Q_\tau)\dd\tau.
+\]
+由积分的 Jensen 不等式以及条件期望的 Jensen 不等式，平方成本满足
+\begin{align}
+\E\norm{Q_1-Q_0}^2
+&\leq \int_0^1\E\norm{u^*_\tau(Q_\tau)}^2\dd\tau\\*
+&=\int_0^1\E\norm{\E[X-Z\mid Y_\tau]}^2\dd\tau\\*
+&\leq \E\norm{X-Z}^2.
+\label{eq:m-reflow-cost}
+\end{align}
+中间等式用了 $Q_\tau$ 与 $Y_\tau$ 的边缘一致性。更一般的凸位移成本也可用同类推理。这是“重新配对不会增加某些理想运输成本”的含义，不能直接替换为“有限网络一定达到全局最优运输”。
+
+更直的轨迹为什么帮助少步采样？若一条轨迹上的速度基本不变，
+Euler 的冻结斜率就更准确；若速度沿途大幅改变，一步就会走偏。
+但端点直线距离较短、轨迹几何较直和速度随时间变化较小，是相关而不完全相同的性质。非均匀时间重参数化可以让同一条直轨迹的速度大小变化剧烈，所以少步误差仍要检查时钟。
+
+实际 reflow 还有边界：教师端点已经含有生成误差，再训练只能保留或改变教师所覆盖的分布；数值生成配对也耗费计算；若训练端点的多样性不足，少步学生可能继承这种不足。reflow 是改变耦合、让少步运动更容易的一条路线，蒸馏则更直接地学习有限步映射。二者可以结合，却不是同一个操作。
+
+\section{从求场到求结果：蒸馏与一致性模型}
+\label{sec:m-distillation}
+
+\subsection{渐进蒸馏：让学生的一步匹配教师的两步}
+
+\term{蒸馏}{gl:distillation}是用已训练模型的行为监督另一个模型。扩散蒸馏的特别之处在于，可以监督一段运动的终点，而非只要求学生在每个时刻预测同一个局部场。渐进蒸馏用确定性教师的两步结果作为学生一步目标，再多轮减半采样步数。\cite{r_vpred}
+
+设教师一步映射为 $T_{k\to j}$，下一步为 $T_{j\to i}$，学生为
+$S^\theta_{k\to i}$，目标可表示为
+\begin{equation}
+L_{\mathrm{dist}}
+=\E\norm{S^\theta_{k\to i}(x_k)
+-T_{j\to i}(T_{k\to j}(x_k))}^2.
+\label{eq:m-distill}
+\end{equation}
+对于 DDIM 式的学生一步映射，可将教师终点反解成所需的数据或其他预测标签，让学生仍使用熟悉的输出接口。学生学习的是在这个跨度上能正确落点的输出，未必等于原模型的无穷小局部噪声预测。
+
+这一区别很重要。数值求解器保持原网络，努力更准确地积分原场；蒸馏改变网络，让粗步规则本身在训练分布上更好用。一个只为四步网格训练的学生，如果被套上原教师的 1000 步祖先采样器，未必正确。学生的适用步数、时刻区间、条件输入和引导尺度都是模型接口的一部分。
+
+教师可以生成很多便宜的监督对，但这些对反映教师质量。若学生容量足够、优化充分，能逼近教师的有限步生成器；若学生容量有限或只用极少步，误差仍会积累。减少推理计算通常会增加训练或配对生成计算，适合反复部署同一个模型，而不是无需成本的数学变换。
+
+\subsection{一致性模型：同一条轨迹的各点映到同一端点}
+
+一致性模型换了输出问题。不是问“这里的方向是什么”，而是问“沿这条概率流轨迹继续走，最后会到哪里”。它学习从不同噪声级别直接映到低噪声端点的函数，并支持一步或少步生成；原工作给出了蒸馏训练和独立训练两类路径。\cite{m_consistency}
+
+将端点设为一个很小的正扩散时刻 $t_{\min}$，以避开可能奇异的精确数据端，理想端点映射为
+\[
+ C(x_t,t)=\Phi_{t\to t_{\min}}(x_t).
+\]
+同一条 ODE 轨迹上的两点满足
+\begin{equation}
+C(x_t,t)=C(x_s,s),\qquad
+C(x,t_{\min})=x.
+\label{eq:m-consistency}
+\end{equation}
+由链式法则，它还满足
+\[
+ \partial_tC(x,t)+J_xC(x,t)w(x,t)=0,
+\]
+其中 $w$ 是概率流场，$J_xC$ 是输入\term{雅可比矩阵}{gl:jacobian}。它并不是零速度方程，而是沿着轨迹端点标签不改变的运输方程。
+
+蒸馏时，从较高噪声点 $x_{t_{i+1}}$ 出发，用教师 ODE 求解器走到
+$\widetilde x_{t_i}$。然后让学生预测
+$C_\theta(x_{t_{i+1}},t_{i+1})$ 接近一个停止梯度的目标
+$C_{\theta^-}(\widetilde x_{t_i},t_i)$。目标网络可采用学生参数的指数滑动平均，用于减缓目标随优化的变化。若只要求两边相同而没有端点条件，恒定函数也能满足一致性，因此边界不是装饰。
+
+常见结构
+\[
+ C_\theta(x,t)=c_{\mathrm{skip}}(t)x+
+ c_{\mathrm{out}}(t)F_\theta(x,t)
+\]
+令 $c_{\mathrm{skip}}(t_{\min})=1$、
+$c_{\mathrm{out}}(t_{\min})=0$，就把端点边界嵌入模型。独立一致性训练则从带噪数据构造局部配对，不依赖已经训练好的扩散教师；其配对、离散尺度和优化方法有专门设计，不能把任意两个共享噪声的时刻预测相同当作完整算法。
+
+一次生成可从高噪声 $x_{t_{\max}}$ 直接计算 $C_\theta$。少步生成还可先得到低噪声预测，再按选定路径重新注入适量噪声、重复映射。这个迭代不是普通 Euler 对局部速度积分，而是在直接端点映射之间安排修正。精确端点映射能一步生成，是因为它把整个积分结果编码到了函数中；普通去噪回归的条件均值没有这个保证。
+
+\subsection{LCM：把端点映射放进潜空间并吸收引导}
+
+LCM 将一致性蒸馏用于潜空间扩散，并把引导后的生成过程作为需要快速近似的目标。\cite{m_lcm} 潜空间的作用是降低生成状态的维度和每次网络调用的成本，数学上仍需要定义噪声路径、场和端点映射。潜变量必须遵循编码器训练时的尺度；最终图像还要经过解码器。
+
+在式~\eqref{eq:cfg} 的约定下，引导场以条件预测和无条件预测线性组合。若学生要吸收一个范围的引导尺度，可以把尺度也作为输入，并在该范围内造教师目标。这样推理时减少重复计算具有明确含义：学生学会了某类引导后的映射。训练范围之外的尺度、不同的负面条件或者修改后的噪声日程，可能不再属于同一个目标接口。
+
+这里还有一个概率概念需要谨慎：使用引导后的近似场，不能笼统声称它仍精确生成原无条件数据分布。引导主动改变了运动方向；它常提高条件服从度，但也会改变多样性和数值稳定性。蒸馏得到的学生首先逼近教师的引导行为，是否满足其他概率性质需要另外分析。
+
+\section{把谱系用于判断：面对一个新方法看什么}
+\label{sec:m-reading}
+
+\begin{table}[htbp]
+\centering
+\caption{本章各路线主要改变哪一环。年代按首个公开版本，会议年份可能在下一年。}
+\label{tab:m-lineage}
+\small
+\begin{tabularx}{\linewidth}{p{0.16\linewidth}p{0.11\linewidth}XX}
+\toprule
+路线 & 公开年份 & 核心操作 & 理解时应保留的边界\\
+\midrule
+DDPM & 2020 & 固定前向链，回归噪声，学习反向高斯 & 反向有限步条件一般只近似高斯\\
+DDIM & 2020 & 保留条件边缘，改变联合构造和更新 & 确定性有限步更新仍有误差\\
+Score SDE & 2020 & 将 score 与反向随机过程、ODE 联系 & 同边缘需真实场和正确积分\\
+Improved DDPM & 2021 & 日程、方差及训练目标改进 & 似然目标与图像质量目标有不同权重\\
+EDM & 2022 & 预条件、训练噪声与数值采样整理 & 设计部件可以分开使用\\
+DPM-Solver & 2022 & 利用半线性结构的高阶积分 & 求解器不能消除场的学习误差\\
+Flow Matching & 2022 & 条件速度回归，学习生成流 & 路径与耦合需要明确指定\\
+Rectified Flow & 2022 & 直线回归与重新端点配对 & 直线标签不保证边缘轨迹直\\
+渐进蒸馏 & 2022 & 学生一步拟合教师多步结果 & 依赖教师与训练跨度接口\\
+一致性、LCM & 2023 & 不同噪声点直接映到轨迹端点 & 端点约束与目标配对不可省略\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+表~\ref{tab:m-lineage} 不是“后者淘汰前者”的时间线。例如，潜空间 DiT 可以使用 Flow Matching 训练，也可以蒸馏为少步学生；噪声预测 U-Net 可以换成 DPM-Solver 采样；EDM 的尺度思想可以帮助其他去噪网络。一个系统通常同时处于几条设计线上。
+
+读新论文时，可先把它还原成以下操作：输入 $y$ 和时间，网络输出 $q_\theta$；目标标签是什么；损失在哪些时刻取期望；输出如何转换成生成场或映射；采样器计算什么。然后再问它改进的证据属于哪个维度：固定网络比求解器，固定计算量比质量，固定教师比学生，还是扩大训练数据与参数之后比最终系统。
+
+例如，“只需四步”至少有四种可能解释：用普通网络粗积分，设计更好的有限步求解器，训练更容易积分的路径，或者蒸馏了四步映射。四种方式在推理接口上都可能出现四次循环，但数学意义、训练成本以及适用边界不同。若实验只有总步数，没有 NFE、教师成本、引导计算和质量指标，就还不能完整评估效率。
+
+生成质量也不是一个数字。FID 使用特征统计衡量两组样本的差异，参见术语附录中的\term{FID}{gl:fid}；它不能逐项验证文字、空间关系、长尾概念和模式覆盖。少步方法可能在某个数据集指标上表现很好，却在复杂组合条件中误差明显。教材中最值得形成的习惯，是先写清比较问题，再选择证据。
+
+\subsection{一个可复现的二维思想实验}
+
+在真实图像之前，可以用二维双峰数据检验自己的理解。设数据为
+\[
+ X\sim\tfrac12\N((-2,0),0.2^2I)
+       +\tfrac12\N((2,0),0.2^2I),
+\qquad Z\sim\N(0,I).
+\]
+对于高斯扰动路径，每个分量的含噪均值和协方差都能解析计算：第 $i$ 个分量均值为 $a(t)m_i$，协方差为
+$[a(t)^2\,0.2^2+b(t)^2]I$。将两个高斯密度按权重相加，求其对数梯度，就得到精确 score。
+
+这时无需训练网络也能比较采样器，先隔离数值误差。用精确场分别运行 ODE Euler、Heun 和合适坐标中的 DDIM，固定 NFE 逐次细化网格，观察两峰是否都出现、峰宽和权重是否正确。再把场换成拟合的小网络，就能看到学习误差叠加后的效果。二维实验不能预测高维图像的最终质量，但能检查公式、方向和尺度是否写错。
+
+对直线 Flow Matching，也可抽大量端点对在网格附近估计条件速度均值，画出场与轨迹。对比原始独立配对和教师生成的新配对，观察“训练直线”和“生成曲线”是否不同。重要的不是把图画得像论文，而是把理论中不可见的条件平均变成可观察对象。
+
+\begin{keybox}{三种误差，三种不同的补救}
+\textbf{路径或端点不匹配：}检查训练与采样的噪声定义、终点先验、潜变量尺度。
+
+\textbf{场的学习误差：}改善网络、数据、目标权重与训练覆盖。
+
+\textbf{积分或有限步映射误差：}调整节点、求解器、路径几何，或用蒸馏学习粗步结果。
+
+增加采样步数主要针对第三项中的积分误差；无法替代前两项的检查。
+\end{keybox}
+
+\section{练习与解答思路}
+\label{sec:m-exercises}
+
+\begin{exercisebox}{练习一：一次预测为什么不能恢复分布}
+设 $X$ 等概率取 $-1$ 和 $1$，$x_t=aX+b\eps$，$\eps\sim\N(0,1)$。
+求 $\E[X\mid x_t=x]$，并说明从很高噪声一次输出该条件均值，为什么不会产生等概率的两个端点。它与一致性模型一步生成有什么不同？
+\end{exercisebox}
+
+\textbf{解答思路。}两类后验概率之比为
+$\exp(2ax/b^2)$，因此
+$\E[X\mid x_t=x]=\tanh(ax/b^2)$。当 $a\to0$，它趋近 0；
+条件平均把不确定端点平均掉。端点映射模型则学习确定性运输轨迹的落点，可以把不同噪声起点送到不同端点；其监督不是该数据去噪条件均值。精确离散端点会涉及终端奇异性，实践中可先以有限低噪声分布理解这种运输，再讨论极限。
+
+\begin{exercisebox}{练习二：推导 DDIM 的一阶坐标}
+从 $\eta=0$ 的式~\eqref{eq:m-ddim-step} 出发，令
+$y_k=x_k/a_k$、$r_k=b_k/a_k$，推导
+$y_j=y_k+(r_j-r_k)e_k$。它是否等于原始时间 $t$ 中的 Euler 更新？为什么一步跳到 $j=0$ 的反例不违背前向边缘一致性？
+\end{exercisebox}
+
+\textbf{解答思路。}把 $\widehat x_0=(x_k-b_ke_k)/a_k$ 代入并除以
+$a_j$ 即得。Euler 的形式依赖坐标和时间变量，变换前后有限步规则一般不同。前向边缘证明在已知真实 $x_0$ 条件下成立，生成时替换成回归估计并做粗步更新，不具有相同保证。
+
+\begin{exercisebox}{练习三：转换目标等于转换权重}
+在 VP 路径中，使用彼此兼容的估计器，证明
+$\norm{\delta\eps}^2=(a^2/b^2)\norm{\delta X}^2$，
+以及 $\norm{\delta v}^2=\norm{\delta X}^2/b^2$。
+若想让三种参数化都优化无权重数据均方误差，各自应乘什么权重？
+\end{exercisebox}
+
+\textbf{解答思路。}固定输入 $x_t$，分别对
+$X=(x_t-b\eps)/a$ 和 $X=ax_t-bv$ 作差即可。噪声损失乘
+$b^2/a^2$，$v$ 损失乘 $b^2$，数据损失乘 1。在精确端点某些权重或转换奇异，因此实际应指定有限区间，并认识到有限网络仍可能因优化尺度产生差异。
+
+\begin{exercisebox}{练习四：时间变换会改变直线速度}
+对 $Y_\tau=(1-\tau)Z+\tau X$，改用时钟
+$\tau=r(s)=s^2$，其中 $s\in[0,1]$。求关于 $s$ 的速度。
+轨迹在空间中仍是直线，为什么用均匀 $s$ 的一步 Euler 可能失败？
+\end{exercisebox}
+
+\textbf{解答思路。}速度为 $2s(X-Z)$，起点速度为 0，因此一步
+Euler 输出仍是 $Z$，尽管精确终点是 $X$。空间轨迹的直与时间速度的恒定是不同性质；选时钟、取节点和分析少步精度都需要考虑后者。
+
+\begin{exercisebox}{练习五：一步学生和一个高阶求解器如何公平比较}
+系统 A 用四步蒸馏网络，每步一次评估；系统 B 用两步 Heun，
+每步两次评估原网络。提出至少四项应记录的量，并解释只报告“步数”可能得出什么错误结论。
+\end{exercisebox}
+
+\textbf{解答思路。}两者都约四次网络评估，但网络大小和引导实现可能不同。
+至少记录 NFE、网络实际耗时、峰值显存、条件与引导设置、同一组样本的质量和多样性；若评价总成本，还记录学生训练和教师配对计算。固定质量比延迟与固定预算比质量都是合理问题，应分别报告。学生针对特定粗步接口训练，Heun 则近似原网络的局部 ODE，二者的可迁移性也需要独立测试。
+
+\chaptertakeaway{算法名称背后有四条可组合的设计线：概率路径、监督输出、采样规则与网络结构。DDPM 提供容易训练的去噪任务，DDIM 使用相同单时刻信息安排另一种运动，Score SDE 连接随机过程与概率流，EDM 和 DPM-Solver 整理数值尺度与积分结构，Flow Matching 和 Rectified Flow 改变速度学习及端点耦合，蒸馏与一致性模型则把昂贵轨迹压缩为有限步结果。真正的理解，是能够写出它的输入、标签、场和更新，并指出每个等价结论成立的条件。下一章将这些部件放回真实生成系统，观察表示空间和网络结构如何扩展应用。}

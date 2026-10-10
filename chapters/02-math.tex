@@ -1,0 +1,733 @@
+\chapter{数学主线：从去噪回归到概率输运}\label{ch:math}
+\readingguide{这一章把“从噪声生成数据”变成可以证明和计算的命题。先推导离散 DDPM 的边缘分布、后验和训练目标；再说明噪声回归为何给出密度的 score；最后进入 SDE、概率流 ODE 与条件流匹配。每条主线都围绕同一个问题：我们没有真实密度的公式，怎样仅凭数据样本学到足以生成的规律？}
+
+\section{先辨认数学对象，再开始推导}
+给定训练样本，我们想让最终生成随机变量的分布接近 $\pdata$。这句话包含三个不同对象。第一个是单个样本的位置 $x$；第二个是描述大量样本如何分布的密度 $p(x)$；第三个是让样本移动的规则，例如转移概率、漂移或速度。生成模型的任务通常是学习第三个对象，从而控制第二个对象。不能把一张图像的变化轨迹当成整个分布的变化规律。
+
+为了把复杂问题拆开，我们人为选定一条容易制造样本的概率路径。DDPM 选定逐步加噪的马尔可夫链；连续扩散选定 SDE；流匹配可以直接选定两个端点之间的插值。这些路径是我们设计的训练工具，不是数据天然附带的物理过程。训练后，我们从路径的简单端出发生成，要求恢复的是数据的分布，而不是逐张恢复训练集。
+
+\begin{keybox}{本章的理想化条件}
+我们把图像表示成 $\R^d$ 中的连续向量，先讨论无条件生成。需要微分密度时，假设噪声端以外的相关密度足够光滑且正，积分、求导和条件期望可以交换；涉及积分分部时要求边界项消失。平方投影要求监督具有有限二阶矩；跨时间的 DSM 还要求加权风险有限，可以截断零噪声端点，或选择合适权重（例如 $\lambda=b^2$）。ODE 与 SDE 的存在唯一性还需要相应的正则性与增长条件。真实离散像素、低维流形和零噪声端点如何处理，见附录\ref{app:probability}与\ref{app:stochastic}。
+\end{keybox}
+
+基本概率符号也值得重申：$q(x_k\mid x_0)$ 是给定某个数据样本后的条件分布；$q(x_k)=\int q(x_k\mid x_0)\pdata(x_0)\dd x_0$ 是将所有数据样本混合后的边缘分布。前者可以是简单高斯，后者仍然可能具有多峰和复杂几何。扩散学习最巧妙的地方，正是利用简单条件分布提供监督，学会处理复杂边缘分布。
+
+\section{DDPM 前向过程：可计算的高斯链}\label{sec:ddpm-forward}
+\subsection{单步加噪与累计信号}
+离散时间用 $k=0,1,\ldots,K$。定义
+\begin{align}
+ q(x_{1:K}\mid x_0)&=\prod_{k=1}^Kq(x_k\mid x_{k-1}),\\
+ q(x_k\mid x_{k-1})&=\N\bigl(\sqrt{\alpha_k}x_{k-1},\beta_kI\bigr),\qquad
+ \alpha_k=1-\beta_k,\quad 0<\beta_k<1.
+\end{align}
+这里 $\beta_k$ 是单步引入的噪声方差，$\alpha_k$ 是单步信号平方尺度。$\sqrt{\alpha_k}$ 轻微缩小输入，避免反复加噪导致总方差无限增长。若输入已经是标准高斯，那么缩放后的方差 $\alpha_kI$ 加上噪声方差 $\beta_kI$，仍是 $I$。因此标准高斯是这条链的不变分布。
+
+这不是说任意输入一步就成为高斯。一步得到的分布是“缩小后的数据分布与高斯的卷积”。要使数据的信息逐渐退场，需要累计信号衰减。
+
+记 $\bar\alpha_k=\prod_{j=1}^k\alpha_j$。写出前两步就能看出规律：
+\begin{align}
+ x_1&=\sqrt{\alpha_1}x_0+\sqrt{\beta_1}z_1,\\
+ x_2&=\sqrt{\alpha_2\alpha_1}x_0
+ +\sqrt{\alpha_2\beta_1}z_1+\sqrt{\beta_2}z_2,
+\end{align}
+其中 $z_1,z_2$ 相互独立，均为标准高斯。后两项之和是高斯，方差为
+$\alpha_2\beta_1+\beta_2=1-\alpha_1\alpha_2$。一般地，若第 $k-1$ 步的条件方差是 $1-\bar\alpha_{k-1}$，下一步为
+\begin{equation}
+ \alpha_k(1-\bar\alpha_{k-1})+\beta_k=1-\bar\alpha_k.
+\end{equation}
+数学归纳得到
+\begin{equation}\boxed{
+ q(x_k\mid x_0)=\N\bigl(\sqrt{\bar\alpha_k}x_0,(1-\bar\alpha_k)I\bigr).
+ }\label{eq:forward-marginal}\end{equation}
+因此训练时不必真的走过 $k$ 次加噪：抽取一个 $\epsilon\sim\N(0,I)$，直接令
+\begin{equation}
+ x_k=\sqrt{\bar\alpha_k}x_0+\sqrt{1-\bar\alpha_k}\epsilon.
+\end{equation}
+这是一种\term{重参数化}{gl:reparameterization}：把带参数的随机变量表示成确定性变换加上标准噪声。一次直接构造只匹配这个时刻的边缘；若多个时刻独立重采样 $\epsilon$，它们的联合分布不再是原来那条马尔可夫链。训练噪声回归只需要单时刻监督，故这一区别不构成问题。
+
+\subsection{为什么终点只是近似标准高斯}
+当 $\bar\alpha_K$ 很小时，$x_K$ 的数据项接近零，条件分布接近标准高斯。但只要 $\bar\alpha_K>0$，在有限步数下一般不会完全等于标准高斯。若数据的均值为 $m$、协方差为 $C$，则
+\begin{align}
+ \E[x_K]&=\sqrt{\bar\alpha_K}m,\\
+ \Cov(x_K)&=\bar\alpha_KC+(1-\bar\alpha_K)I.
+\end{align}
+即使这些一、二阶量接近高斯，高阶统计量也可能残留。把生成起点设成 $\N(0,I)$ 是有意采用的近似；噪声日程、终点信噪比与训练、采样的一致性都影响误差。
+
+\term{信噪比}{gl:snr}在 VP 表示下通常定义为
+\begin{equation}
+ \SNR(k)=\frac{\bar\alpha_k}{1-\bar\alpha_k}.
+\end{equation}
+它比较信号与注入噪声的平方尺度；如果数据各方向方差不同，真实方向上的信噪比还要乘以对应数据方差。因此它是日程的指标，并不是所有图像和所有频率具有完全相同的可辨识度。
+
+\section{反向后验：有原图时为什么能算}\label{sec:ddpm-posterior}
+我们希望生成时使用 $q(x_{k-1}\mid x_k)$，但它混合了所有可能的 $x_0$，通常难以直接计算。训练时我们却知道抽到的原图，因而可以计算更强的条件后验 $q(x_{k-1}\mid x_k,x_0)$。这是“可计算教师”和“可部署学生”之间的关键区别。
+
+利用贝叶斯公式和前向边缘，对 $k\ge2$ 有
+\begin{equation}
+ q(x_{k-1}\mid x_k,x_0)\propto
+ q(x_k\mid x_{k-1})q(x_{k-1}\mid x_0).
+\end{equation}
+令 $y=x_{k-1}$，对数密度中与 $y$ 有关的部分是
+\begin{equation}
+ -\frac{\norm{x_k-\sqrt{\alpha_k}y}^2}{2\beta_k}
+ -\frac{\norm{y-\sqrt{\bar\alpha_{k-1}}x_0}^2}{2(1-\bar\alpha_{k-1})}.
+\end{equation}
+把平方展开，$\norm{y}^2$ 的精度系数与线性项分别为
+\begin{align}
+ A&=\frac{\alpha_k}{\beta_k}+\frac{1}{1-\bar\alpha_{k-1}}
+   =\frac{1-\bar\alpha_k}{\beta_k(1-\bar\alpha_{k-1})},\\
+ h&=\frac{\sqrt{\alpha_k}}{\beta_k}x_k+
+ \frac{\sqrt{\bar\alpha_{k-1}}}{1-\bar\alpha_{k-1}}x_0.
+\end{align}
+配方 $-A\norm{y}^2/2+\ip{h}{y}=-A\norm{y-A^{-1}h}^2/2+\text{常数}$，于是
+\begin{align}
+ q(x_{k-1}\mid x_k,x_0)&=\N(\widetilde\mu_k,\widetilde\beta_k I),\label{eq:posterior}\\
+ \widetilde\beta_k&=\frac{1-\bar\alpha_{k-1}}{1-\bar\alpha_k}\beta_k,\\
+ \widetilde\mu_k&=\frac{\sqrt{\bar\alpha_{k-1}}\beta_k}{1-\bar\alpha_k}x_0
+ +\frac{\sqrt{\alpha_k}(1-\bar\alpha_{k-1})}{1-\bar\alpha_k}x_k.
+\end{align}
+把 $x_0=(x_k-\sqrt{1-\bar\alpha_k}\epsilon)/\sqrt{\bar\alpha_k}$ 代回，可将均值写为
+\begin{equation}
+ \widetilde\mu_k=\frac{1}{\sqrt{\alpha_k}}
+ \left(x_k-\frac{\beta_k}{\sqrt{1-\bar\alpha_k}}\epsilon\right).
+ \label{eq:posterior-noise}
+\end{equation}
+注意这一项里的 $\epsilon$ 是此次训练构造中实际使用的噪声。生成时它不可观测；网络会根据 $x_k$ 和 $k$ 估计它。
+
+\begin{cautionbox}{高斯后验与真实逆过程}
+“已知 $x_0$ 的后验是高斯”不意味着“只知道 $x_k$ 的真实反向条件也是同一个高斯”。后者对 $x_0$ 的后验作混合，可能多峰。DDPM 使用单个高斯建模局部反向转移，在足够小的噪声步长下与反向扩散相协调；有限步的大跨度跳跃不自动保留这一近似精度。
+\end{cautionbox}
+
+\subsection{后验混合的均值与方差：误差藏在哪里}
+把后验均值写成 $\widetilde\mu_k=A_kx_0+B_kx_k$，其中 $A_k=\sqrt{\bar\alpha_{k-1}}\beta_k/(1-\bar\alpha_k)$。对 $x_0\mid x_k$ 作平均，有
+\begin{equation}
+ \E[x_{k-1}\mid x_k]=A_k\E[x_0\mid x_k]+B_kx_k.
+\end{equation}
+因此一个达到理想噪声回归最优值的网络，可以得到真实逆条件的均值。这是比“高斯近似可能合理”更精确的结论。
+
+但是方差还含有原图后验的不确定性。由全方差公式，
+\begin{align}
+ \Cov(x_{k-1}\mid x_k)
+ &=\E[\Cov(x_{k-1}\mid x_k,x_0)\mid x_k]
+ +\Cov(\E[x_{k-1}\mid x_k,x_0]\mid x_k)\\
+ &=\widetilde\beta_k I+A_k^2\Cov(x_0\mid x_k).
+\end{align}
+第二项可以具有方向性，甚至在某些观测附近很大。仅把逆转移方差设为 $\widetilde\beta_kI$，不能把整个混合分布的协方差全部表示出来；采用另一个固定方差或学习方差，是处理近似的不同选择。
+
+这也解释了为何一步从几乎纯噪声跳回干净图像困难。高噪声下许多原图都合理，后验均值可能缺少清晰结构；局部小步则不必一次解决所有歧义。小步并不是“让网络重复猜同一个答案”，而是在不断变化的边缘分布中逐步重建信息。其代价是多次网络调用，第三章的加速工作就从这里出发。
+
+\section{ELBO 如何变成噪声均方误差}\label{sec:ddpm-elbo}
+\subsection{先写完整的生成模型}
+反向生成模型是
+\begin{equation}
+ p_\theta(x_{0:K})=p(x_K)\prod_{k=1}^Kp_\theta(x_{k-1}\mid x_k),\qquad
+ p(x_K)=\N(0,I).
+\end{equation}
+$p_\theta(x_0)$ 必须把全部隐藏状态积分掉；直接求这个积分很困难。我们使用已知的 $q(x_{1:K}\mid x_0)$ 作为辅助分布。由 Jensen 不等式，
+\begin{align}
+ \log p_\theta(x_0)
+ &=\log\E_q\left[\frac{p_\theta(x_{0:K})}{q(x_{1:K}\mid x_0)}\right]\\
+ &\ge\E_q\left[\log p_\theta(x_{0:K})-\log q(x_{1:K}\mid x_0)\right].
+\end{align}
+右边是\term{证据下界}{gl:elbo}。下界与真实对数似然的差恰是辅助后验与模型后验之间的 KL；这个恒等式及 Jensen 的适用条件见附录\ref{app:probability}。
+
+把负下界记作 $L_{\mathrm{VLB}}$。前向链也可沿反向条件分解为
+\begin{equation}
+ q(x_{1:K}\mid x_0)=q(x_K\mid x_0)
+ \prod_{k=2}^Kq(x_{k-1}\mid x_k,x_0).
+\end{equation}
+它与生成分解逐项相减，得到
+\begin{align}
+ L_{\mathrm{VLB}}(x_0)
+ =&\ \KL\bigl(q(x_K\mid x_0)\Vert p(x_K)\bigr)\nonumber\\
+ &+\sum_{k=2}^K\E_{q(x_k\mid x_0)}
+ \KL\bigl(q(x_{k-1}\mid x_k,x_0)\Vert p_\theta(x_{k-1}\mid x_k)\bigr)\nonumber\\
+ &-\E_{q(x_1\mid x_0)}\log p_\theta(x_0\mid x_1).
+ \label{eq:elbo}
+\end{align}
+三部分依次是终点匹配、每一步逆转匹配和最后一步重建。若前向日程固定，终点匹配不依赖 $\theta$。最后一步仍然是有效似然项；量化图像可以使用离散化高斯解码似然，连续教材模型也可使用适当连续解码分布。它不能凭空消失。
+
+\subsection{两高斯之间的 KL 给出回归问题}
+设 $p_\theta(x_{k-1}\mid x_k)=\N(\mu_\theta(x_k,k),\sigma_k^2 I)$，暂时把 $\sigma_k$ 固定。由高斯 KL 公式，
+\begin{align}
+ &\KL\bigl(\N(\widetilde\mu_k,\widetilde\beta_k I)
+ \Vert\N(\mu_\theta,\sigma_k^2I)\bigr)\nonumber\\
+ &=\frac{\norm{\widetilde\mu_k-\mu_\theta}^2}{2\sigma_k^2}
+ +\frac d2\left(\frac{\widetilde\beta_k}{\sigma_k^2}-1+
+ \log\frac{\sigma_k^2}{\widetilde\beta_k}\right).
+\end{align}
+对均值网络而言，第二项是常数。选取与式\eqref{eq:posterior-noise}匹配的参数化
+\begin{equation}
+ \mu_\theta(x_k,k)=\frac{1}{\sqrt{\alpha_k}}
+ \left(x_k-\frac{\beta_k}{\sqrt{1-\bar\alpha_k}}\epsilon_\theta(x_k,k)\right),
+\end{equation}
+相减并平方后，每一步与参数有关的 KL 就是
+\begin{equation}
+ \frac{\beta_k^2}{2\sigma_k^2\alpha_k(1-\bar\alpha_k)}
+ \E\norm{\epsilon-\epsilon_\theta(x_k,k)}^2.
+ \label{eq:weighted-noise}
+\end{equation}
+这是一个有严格来源的加权均方误差。但常用 DDPM 训练目标会简化权重：
+\begin{equation}\boxed{
+ L_{\mathrm{simple}}=\E_{\substack{k\sim\mathrm{Unif}\{1,\ldots,K\}\\
+ x_0\sim\pdata,\ \epsilon\sim\N(0,I)}}
+ \norm{\epsilon-\epsilon_\theta(x_k,k)}^2.
+ }\label{eq:simple-loss}\end{equation}
+这一简化在 DDPM 中有重要作用\cite{r_ddpm}。它重新分配不同噪声尺度的学习重点，不能把它称为“原封不动的最大似然”或“完整 ELBO”。网络容量无限且每个时刻的权重严格为正时，各时刻最优回归函数不变；共享有限网络下，权重会改变优化、资源分配和最终误差。
+
+如果同时学习方差，KL 中的方差项也依赖参数；只保留均值误差就不再是完整目标。为什么很多实现混合简单损失与变分损失，第三章会继续解释。
+
+\subsection{回归最优值不是训练时那份噪声}
+平方损失存在一个值得单独证明的性质。令输入为 $U$、监督为 $V$，记 $m(U)=\E[V\mid U]$。则
+\begin{align}
+ \E\norm{h(U)-V}^2
+ &=\E\norm{h(U)-m(U)}^2+\E\norm{V-m(U)}^2.
+ \label{eq:conditional-projection}
+\end{align}
+交叉项为零，因为 $\E[V-m(U)\mid U]=0$。因此
+\begin{equation}
+ \epsilon_*(x_k,k)=\E[\epsilon\mid x_k,k].
+\end{equation}
+这不是精确认出某次加噪的随机数。多个原图和多个噪声都能产生相同的 $x_k$；网络输出是后验平均。你可能担心“平均不是会造成模糊吗？”如果直接把这个均值作为整张最终图，确实可能如此。但扩散把平均作为局部转移的组成部分，配合不同尺度的迭代和必要的随机性来生成整个分布。接下来我们会看到，这个后验平均竟然恰好编码了边缘密度的梯度。
+
+\section{Score：把条件去噪连接到边缘密度}\label{sec:score}
+\subsection{为什么对密度取对数，再求梯度}
+给定光滑正密度，定义
+\begin{equation}
+ s_t(x)=\grad_x\log p_t(x)=\frac{\grad_xp_t(x)}{p_t(x)}.
+\end{equation}
+这里的\term{score}{gl:score}是对状态 $x$ 求导，而不是经典统计里对参数求导的 score。它是向量场，给出当前位置上对数密度增加最快的方向和速率。若未归一化密度写为 $p(x)=e^{-E(x)}/Z$，那么 $s(x)=-\grad E(x)$；归一化常数 $Z$ 对 $x$ 的导数为零。这解释了为何学习 score 有机会避开昂贵的归一化积分。
+
+但 score 不是“图像质量梯度”，也不是全局语义坐标。一个真实分布的两个对称峰之间，score 可以为零，而该位置的密度很低；仅做梯度上升可能停在那里或集中到少数峰。如何从 score 得到正确分布，需要动力学而不只是方向直觉。
+
+\subsection{条件 score 的平均就是边缘 score}
+采用连续表示 $x_t=a(t)x_0+b(t)\epsilon$，缩写 $a=a(t),b=b(t)>0$。已知条件核
+\begin{equation}
+ q_t(x\mid x_0)=\N(ax_0,b^2I),\qquad
+ \grad_x\log q_t(x\mid x_0)=-\frac{x-ax_0}{b^2}=-\frac\epsilon b.
+\end{equation}
+我们不能直接计算 $p_t(x)$，但可以作形式上的求导：
+\begin{align}
+ \grad_xp_t(x)
+ &=\int\pdata(x_0)\grad_xq_t(x\mid x_0)\dd x_0\\
+ &=\int\pdata(x_0)q_t(x\mid x_0)
+       \grad_x\log q_t(x\mid x_0)\dd x_0.
+\end{align}
+除以 $p_t(x)$，由贝叶斯公式识别出 $q_t(x_0\mid x)$，得到
+\begin{equation}\boxed{
+ s_t(x)=\E\left[\grad_x\log q_t(x\mid x_0)\mid x_t=x\right]
+       =-\frac{\E[\epsilon\mid x_t=x]}{b(t)}.
+ }\label{eq:dsm}\end{equation}
+结合平方损失投影性质，噪声预测网络的最优值恰给出
+$s_\theta(x,t)=-\epsilon_\theta(x,t)/b(t)$。这并不需要知道真实边缘密度的归一化常数。
+
+称下面的可训练目标为\term{去噪 score matching}{gl:score}：
+\begin{equation}
+ L_{\mathrm{DSM}}=\E_{t,x_0,\epsilon}\lambda(t)
+ \norm{s_\theta(x_t,t)+\epsilon/b(t)}^2.
+\end{equation}
+令 $H=-\epsilon/b(t)$，在每个 $t$ 上使用式\eqref{eq:conditional-projection}，便有
+\begin{equation}
+ L_{\mathrm{DSM}}=\E_{t,x_t}\lambda(t)\norm{s_\theta(x_t,t)-s_t(x_t)}^2+C,
+\end{equation}
+其中 $C$ 与 $\theta$ 无关。这说明条件监督和难以直接计算的边缘监督具有相同优化方向。它们的损失数值一般不相同；条件监督仍包含不可消除的方差。早期 score-based 生成及其连续统一框架分别见\cite{r_ncsn,r_sde}，更一般的 score matching 背景见\cite{r_scorematching}。
+
+\subsection{Tweedie 关系：从 score 找到后验均值}
+把式\eqref{eq:dsm}写成 $s_t(x)=-(x-a\E[x_0\mid x_t=x])/b^2$，可得
+\begin{equation}\boxed{
+ \E[x_0\mid x_t=x]=\frac{x+b(t)^2s_t(x)}{a(t)},\quad a(t)\ne0.
+ }\label{eq:tweedie}\end{equation}
+它常称为高斯去噪的 Tweedie 关系。加性噪声 $a=1$ 时最容易理解：后验均值等于当前点加上由 score 指示的修正。噪声大时偏离数据规律的可能性大，修正尺度 $b^2$ 也大。不过真实 score 自身会随噪声变化，不能只看这个系数推断每一步移动距离。
+
+\begin{examplebox}{单峰高斯可以把关系全部算出来}
+设 $x_0\sim\N(m,cI)$，则 $x_t\sim\N(am,(a^2c+b^2)I)$，
+\begin{equation}
+ s_t(x)=-\frac{x-am}{a^2c+b^2}.
+\end{equation}
+代入式\eqref{eq:tweedie}，得到
+\begin{equation}
+ \E[x_0\mid x_t=x]
+ =m+\frac{ac}{a^2c+b^2}(x-am).
+\end{equation}
+当观测信号很弱时，估计向先验均值收缩；当噪声很小时，观测本身占主导。这里的“收缩”来自贝叶斯条件平均，并不是网络偶然学到的图像滤镜。
+\end{examplebox}
+
+\subsection{一个双峰例子：为什么需要多个尺度}
+考虑一维数据为 $\tfrac12\N(-m,c)+\tfrac12\N(m,c)$。在加性噪声 $x=x_0+b\epsilon$ 下令 $h=c+b^2$，则
+\begin{equation}
+ p_b(x)\propto\exp\left(-\frac{x^2+m^2}{2h}\right)
+ \cosh\left(\frac{mx}{h}\right),
+\end{equation}
+从而
+\begin{equation}
+ s_b(x)=-\frac{x}{h}+\frac m h\tanh\left(\frac{mx}{h}\right).
+\end{equation}
+在高噪声下，两个峰合并，score 更平滑；在低噪声下，中间附近的 score 将左右两侧分别引向两个峰。对称中心始终满足 $s_b(0)=0$，但当 $h<m^2$ 时它是低密度局部极小值。实际随机起点不会全部精确落在中心；随着路径演化，整团概率分配到不同峰。这个例子提醒我们，score 的零点与高概率点不能等同。
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}
+\begin{axis}[width=.94\linewidth,height=57mm,xmin=-4,xmax=4,
+ xlabel={$x$},ylabel={密度},ymin=0,legend style={font=\small,draw=none},
+ legend pos=north east,axis lines=left,samples=150,domain=-4:4]
+\addplot[teal,thick]{0.5/sqrt(2*pi*0.3)*(exp(-(x-1.6)^2/(2*0.3))+exp(-(x+1.6)^2/(2*0.3)))};
+\addlegendentry{低噪声：$h=0.3$}
+\addplot[gold,thick,dashed]{0.5/sqrt(2*pi*3)*(exp(-(x-1.6)^2/6)+exp(-(x+1.6)^2/6))};
+\addlegendentry{高噪声：$h=3$}
+\end{axis}
+\end{tikzpicture}
+\caption{原创解析例子：高斯平滑把两个清晰峰变成更容易学习的宽分布。曲线由上式直接计算，$m=1.6$；它展示边缘密度而非某条去噪轨迹。}\label{fig:math-mixture}
+\end{figure}
+
+\subsection{Langevin 动力学：为什么沿 score 走还要加噪声}
+在固定噪声尺度上，如果只用 $\dot x=s(x)$，每个样本都在爬升对数密度。最终可能集中到若干局部模式，而不是保持目标密度的峰宽与相对概率。要抽取整个分布，另一种经典动力学是
+\begin{equation}
+ \dd X_r=s(X_r)\dd r+\sqrt2\dd W_r.
+ \label{eq:langevin}
+\end{equation}
+这里 $r$ 是在固定目标密度下运行的采样时钟，区别于改变噪声尺度的扩散时间 $t$。它的 Fokker--Planck 方程是
+\begin{equation}
+ \partial_r\rho_r=-\divg(\rho_rs)+\Delta\rho_r.
+\end{equation}
+如果 $s=\grad\log p$，代入候选稳态 $\rho=p$，因为 $ps=\grad p$，右边等于 $-\Delta p+\Delta p=0$。因此 $p$ 是不变密度。合适的遍历性、尾部和正则性条件才进一步保证从别的初始分布趋近它；仅仅验证右边为零并不证明收敛速度，也不证明任意离散步长下都能无偏抽样。
+
+这个抵消提供了很具体的直觉：score 将粒子聚向高密度区域，随机扩散将它们铺开，两种作用在正确的密度下平衡。如果把随机项删掉，平衡就被破坏。与反向扩散不同，Langevin 在此追踪一份不随 $r$ 变化的目标密度；实际 annealed Langevin 依次更换平滑尺度，希望从较简单的密度走向较复杂的密度。有限次更新可能尚未达到每个尺度的平衡。
+
+其离散更新为 $x\leftarrow x+\eta s(x)+\sqrt{2\eta}z$。它常用于 predictor--corrector 中的 corrector。加噪在这里是为了修正分布探索，不是因为网络没预测出应当消去的所有噪声。第三章会把它与用于跨时刻的 predictor 放在一起比较。
+
+\begin{examplebox}{温度改变了目标，而不只是改变随机种子}
+若固定漂移为 $s=\grad\log p$，将噪声强度改为 $\sqrt{2T}$，则在可归一化的条件下，候选不变密度为 $\rho_T\propto p^{1/T}$。因为 $\grad\rho_T=\rho_Ts/T$，代入 $-\divg(\rho_Ts)+T\Delta\rho_T$ 就得到零。$T<1$ 使密度更集中，$T>1$ 使它更分散。这个结论是固定密度的稳态分析，不能直接当成时间变化的 CFG 终点分布公式。
+\end{examplebox}
+
+\section{预测目标的等价与不等价}\label{sec:parameterization}
+在 $x_t=ax_0+b\epsilon$ 下，预测噪声、预测原图与预测 score 之间可以作代数转换：
+\begin{equation}
+ \widehat x_0=\frac{x_t-b\widehat\epsilon}{a},\qquad
+ \widehat s=-\frac{\widehat\epsilon}{b}.
+\end{equation}
+这些公式要求分母非零。靠近纯噪声端，$a$ 很小，噪声预测的一点误差转换成 $x_0$ 误差会被放大；靠近数据端，$b$ 很小，噪声误差转换成 score 误差也会被放大。不同目标不仅是改名字，还影响数值条件。
+
+若 $a^2+b^2=1$，定义常用的 $v$ 目标\cite{r_vpred}：
+\begin{equation}
+ v=a\epsilon-bx_0.
+\end{equation}
+把两个关系合并，就是二维系数平面中的旋转：
+\begin{equation}
+ \begin{bmatrix}x_t\\v\end{bmatrix}
+ =\begin{bmatrix}a&b\\-b&a\end{bmatrix}
+ \begin{bmatrix}x_0\\\epsilon\end{bmatrix}.
+\end{equation}
+矩阵是正交矩阵，逆变换不需要除以接近零的 $a$ 或 $b$：
+\begin{equation}\boxed{
+ \widehat x_0=ax_t-b\widehat v,\qquad
+ \widehat\epsilon=bx_t+a\widehat v.
+ }\label{eq:vconversion}\end{equation}
+这给出选择 $v$ 参数化的一个直观理由。但在同一有限网络和固定损失权重下，不同参数化的训练效果没有数学上自动相同的保证。
+
+若写 $a=\cos\phi(t),b=\sin\phi(t)$，在固定 $x_0,\epsilon$ 的插值曲线上，
+\begin{equation}
+ \frac{\dd x_t}{\dd t}=\phi'(t)(a\epsilon-bx_0)=\phi'(t)v.
+\end{equation}
+$v$ 是对角度 $\phi$ 的导数目标；只有相应角度时间尺度下才直接等于这条条件曲线的速度。更进一步，网络的最优 $v$ 是条件均值，边缘 ODE 速度需要对隐含端点平均。SDE 的实际样本路径则几乎处处没有普通时间导数。把所有这些对象都称作“速度”会掩盖重要差异。
+
+\subsection{损失权重与时间抽样也属于模型设计}
+假设 $x_0$ 预测误差为 $e_x$，经代数转换的噪声误差是 $e_\epsilon=-(a/b)e_x$。因此
+\begin{equation}
+ \norm{e_\epsilon}^2=\frac{a^2}{b^2}\norm{e_x}^2.
+\end{equation}
+均匀权重的噪声损失等价于以 SNR 加权的原图损失，而不是均匀的原图损失。$v$ 损失经式\eqref{eq:vconversion}转换，也有自己的尺度权重。
+
+同样，“均匀抽时间”只有在确定了时钟后才有意义。令 $\lambda(t)=\log(a(t)^2/b(t)^2)$ 为对数信噪比；从均匀 $t$ 改为在某个有限截断区间上均匀 $\lambda$，改变的是概率质量分配给各噪声尺度的方式。完整无穷 log-SNR 区间上不存在均匀概率分布。若目标积分为 $\int w(t)\ell(t)\dd t$ 而抽样密度为 $r(t)$，无偏估计应使用 $w(t)\ell(t)/r(t)$。实际方法也可能有意改变目标权重；要区分“重要性抽样加速同一目标”和“重新定义目标”。
+
+\section{从离散链走向连续 SDE}\label{sec:sde}
+\subsection{微小高斯增量意味着什么}
+将时间区间分为小段 $\Delta t$，令单步噪声方差 $\beta_k=\beta(t_k)\Delta t$。一阶展开
+\begin{equation}
+ \sqrt{1-\beta(t)\Delta t}=1-\tfrac12\beta(t)\Delta t+O(\Delta t^2).
+\end{equation}
+因此 DDPM 的增量近似为
+\begin{equation}
+ x_{k+1}-x_k=-\tfrac12\beta(t_k)x_k\Delta t
+ +\sqrt{\beta(t_k)}\sqrt{\Delta t}\,z_k.
+\end{equation}
+第一项尺度是 $\Delta t$，第二项是 $\sqrt{\Delta t}$；这两个尺度的差别决定了随机微积分。把极限写成\term{随机微分方程}{gl:sde}：
+\begin{equation}
+ \dd x_t=-\tfrac12\beta(t)x_t\dd t+\sqrt{\beta(t)}\dd W_t.
+ \label{eq:vp-sde}
+\end{equation}
+$W_t$ 是标准\term{布朗运动}{gl:brownian}，独立增量 $W_{t+h}-W_t\sim\N(0,hI)$。$\dd W_t$ 不是一个普通函数的微分；它表示随机积分里的增量。给 SDE 写导数 $\dot x_t$ 通常没有意义。
+
+更一般地，我们先限制到各向同性、仅依赖时间的扩散系数：
+\begin{equation}
+ \dd x_t=f(x_t,t)\dd t+g(t)\dd W_t.
+ \label{eq:general-sde}
+\end{equation}
+$f$ 称为漂移，描述可预测的平均运动；$g$ 称为扩散强度，$g^2\Delta t$ 是小步噪声协方差。这里 $g$ 与图像生成模型的名字“Diffusion”相关，但不要把“diffusion coefficient”误译成网络预测的噪声值。
+
+式\eqref{eq:vp-sde}称为方差保持（VP）SDE，因为标准高斯是其不变分布。这不意味着任何初始数据的方差在所有时刻都恒定。设
+\begin{equation}
+ B(t)=\int_0^t\beta(r)\dd r,\quad
+ a(t)=e^{-B(t)/2},\quad b(t)^2=1-e^{-B(t)}.
+\end{equation}
+线性 SDE 的积分因子解给出
+\begin{equation}
+ x_t=a(t)x_0+a(t)\int_0^t a(r)^{-1}\sqrt{\beta(r)}\dd W_r.
+\end{equation}
+后面的随机积分为均值零高斯，其方差由 It\^o 等距得到
+\begin{equation}
+ a(t)^2\int_0^t a(r)^{-2}\beta(r)\dd r=1-a(t)^2.
+\end{equation}
+故条件边缘仍是 $\N(a(t)x_0,b(t)^2I)$。这恰连接到 DDPM 的累计信号，而不是一个与离散模型毫无关系的新对象。
+
+另一类方差增长（VE）SDE 不缩小数据，而让噪声方差增加。若 $\sigma(0)=0$ 且 $\sigma^2$ 可微单调增长，可写
+\begin{equation}
+ \dd x_t=\sqrt{\frac{\dd\sigma(t)^2}{\dd t}}\dd W_t,
+ \qquad x_t\mid x_0\sim\N(x_0,\sigma(t)^2I).
+\end{equation}
+实际方法常从小的正噪声 $\sigma_{\min}$ 开始；这时核的方差取决于初始分布是否已作平滑，必须明确。VP 通过信号衰减得到简单端，VE 通过噪声压过数据尺度得到近似简单端。两者是不同的路径设计，不是不同的网络层。
+
+\subsection{从粒子方程推导密度方程}
+取一个二阶可微的标量测试函数 $\varphi(x)$。It\^o 公式给出
+\begin{equation}
+ \dd\varphi(x_t)=\left(f\cdot\grad\varphi+\tfrac12g^2\Delta\varphi\right)\dd t
+ +g\grad\varphi\cdot\dd W_t.
+\end{equation}
+取期望，随机积分均值为零，得到
+\begin{equation}
+ \frac{\dd}{\dd t}\int\varphi(x)p_t(x)\dd x
+ =\int\left(f\cdot\grad\varphi+\tfrac12g^2\Delta\varphi\right)p_t(x)\dd x.
+\end{equation}
+对右边积分分部一次和两次，在边界项消失时，有
+\begin{equation}\boxed{
+ \partial_tp_t=-\divg(f p_t)+\tfrac12g(t)^2\Delta p_t.
+ }\label{eq:fokker-planck}\end{equation}
+这就是\term{Fokker--Planck 方程}{gl:fp}。SDE 描述一个随机粒子；Fokker--Planck 描述大量粒子的密度。拉普拉斯项让密度向四周扩散；漂移项把密度随向量场搬运。$1/2$ 来自 It\^o 二阶项，而不是任意选的缩放。
+
+这个推导也解释了为什么随机微积分必须保留二阶项：布朗增量的平方量级是 $\Delta t$，与普通漂移增量一样重要。附录\ref{app:stochastic}会用有限步 Taylor 展开补齐这一点。
+
+\section{反向 SDE：倒转随机过程需要 score}\label{sec:reverse-sde}
+\subsection{先把时钟说清楚}
+继续使用前向时间 $t$，但生成时令 $t$ 从 $1$ 走向 $0$。在前述正则性条件下，反向 SDE 为\cite{r_anderson,r_sde}
+\begin{equation}\boxed{
+ \dd x_t=\left[f(x_t,t)-g(t)^2s_t(x_t)\right]\dd t
+ +g(t)\dd\overline W_t,\qquad \dd t<0.
+ }\label{eq:reverse-sde}\end{equation}
+$\overline W_t$ 是按反向时间计的布朗运动；它的小步方差是 $|\dd t|$，不是负数。反向 SDE 与前向 SDE 一般不共用同一条噪声实现。我们反转的是随机过程的分布规律，而不是逐次撤销同一组随机数。
+
+若不喜欢负时间增量，设反向时钟 $r=1-t$，$y_r=x_{1-r}$。用正向增长的 $r$ 写就是
+\begin{equation}
+ \dd y_r=\left[-f(y_r,1-r)+g(1-r)^2s_{1-r}(y_r)\right]\dd r
+ +g(1-r)\dd\widetilde W_r.
+ \label{eq:reverse-clock}
+\end{equation}
+两式含义相同。看到论文中的 $f-g^2s$ 和 $-f+g^2s$ 时，先查时钟，再判断符号。生成小步 $h>0$ 的 Euler--Maruyama 形式为
+\begin{equation}
+ x_{t-h}=x_t-h f(x_t,t)+h g(t)^2s_\theta(x_t,t)
+ +g(t)\sqrt h\,z.
+ \label{eq:reverse-euler}
+\end{equation}
+
+\subsection{score 修正的来源}
+为什么不能仅仅给漂移加一个负号？因为给定当前 $x$，过去的样本并不是在所有方向等概率。贝叶斯公式把前一时刻更常出现的位置赋予更大后验权重。
+
+以纯加性的小步噪声为例，$X_t=X_{t-h}+g\sqrt h Z$。对 $X_t=x$，高斯去噪关系给出
+\begin{equation}
+ \E[X_{t-h}\mid X_t=x]=x+h g^2\grad_x\log p_t(x).
+\end{equation}
+再加入前向漂移的反向抵消，局部反向均值就是
+$x-hf(x,t)+hg^2s_t(x)+o(h)$。局部协方差主导项仍是 $hg^2I$。这便揭示了反向漂移中 score 项的来源。一般情形的小步密度推导与矩阵扩散修正见附录\ref{app:proofs}。
+
+仅检查一条密度方程，并不足以唯一确定“哪个 SDE 才是原过程的时间反转”，因为不同概率流可以给出相同的密度变化。反向 SDE 的严格结论还依赖逆向转移概率及其小步极限。这个区分会在概率流 ODE 中再次出现。
+
+\subsection{与离散 DDPM 的局部联系}
+对 VP SDE，$f=-\beta(t)x/2,g^2=\beta(t)$。反向小步均值为
+\begin{equation}
+ x+h\beta(t)\left(\tfrac12x+s_t(x)\right).
+\end{equation}
+DDPM 均值参数化用 $s_\theta=-\epsilon_\theta/\sqrt{1-\bar\alpha_k}$，于是
+\begin{equation}
+ \mu_\theta=\frac{x_k+\beta_k s_\theta(x_k,k)}{\sqrt{1-\beta_k}}
+ =x_k+\beta_k\left(\tfrac12x_k+s_\theta\right)+O(\beta_k^2).
+\end{equation}
+两者一阶对应。这说明 DDPM 的高斯均值与连续反向扩散共享局部结构。但有限步方差选取、端点解码和时间离散化会使实际采样器不同；不能从一阶展开推出所有离散算法完全等价。
+
+\section{概率流 ODE：把扩散项写成输运}\label{sec:pfode}
+\subsection{概率流中的一半系数}
+由于 $\grad p_t=p_ts_t$ 且 $g$ 不依赖状态，式\eqref{eq:fokker-planck}可以重写为
+\begin{align}
+ \partial_tp_t
+ &=-\divg(f p_t)+\tfrac12g^2\divg(p_ts_t)\\
+ &=-\divg\left[\left(f-\tfrac12g^2s_t\right)p_t\right].
+\end{align}
+而确定性 ODE $\dot x_t=v_t(x_t)$ 所诱导的密度满足\term{连续性方程}{gl:continuity}
+\begin{equation}
+ \partial_tp_t+\divg(p_tv_t)=0.
+\end{equation}
+因此选择
+\begin{equation}\boxed{
+ \frac{\dd x_t}{\dd t}=v_t^{\mathrm{PF}}(x_t)
+ =f(x_t,t)-\tfrac12g(t)^2s_t(x_t)
+ }\label{eq:pfode}\end{equation}
+即可得到与原 SDE 相同的单时刻边缘密度，条件是精确 score、相同的初始边缘与适当的解唯一性。生成时将此 ODE 从 $t=1$ 积分到 $t=0$。这就是概率流（probability flow）ODE\cite{r_sde}。
+
+反向 SDE 的 score 系数是 $g^2$，概率流 ODE 是 $g^2/2$。如果把反向 SDE 的随机项删掉，仍保留完整的 $g^2$，所得 ODE 一般不再具有所需边缘分布。删掉噪声必须同时调整漂移，因为随机扩散本身已经在搬运概率。
+
+\begin{examplebox}{一条随机游走的过程与一条静止的过程}
+设数据本来就是 $\N(0,I)$，并使用 VP SDE。每个时刻都保持 $\N(0,I)$，所以 $s_t(x)=-x$。概率流速度为
+\begin{equation}
+ -\tfrac12\beta x-\tfrac12\beta(-x)=0.
+\end{equation}
+ODE 样本一直停在最初随机抽到的位置。SDE 样本却不断随机运动。两者每个时刻的密度完全一致，联合轨迹分布显然不同。这是检验“同边缘不等于同路径”最简洁的例子。
+\end{examplebox}
+
+\subsection{连续性方程的几何意义}
+对一个小区域 $A$，其概率质量随时间的变化是穿过边界的净流量：
+\begin{equation}
+ \frac{\dd}{\dd t}\int_Ap_t(x)\dd x
+ =-\int_{\partial A}p_tv_t\cdot n\dd S.
+\end{equation}
+$p_tv_t$ 是概率流密度，$n$ 为边界外法向。散度表示单位体积的净流出量：$\divg(p_tv_t)>0$ 时该位置的密度下降。不能只看 $\divg v_t$ 判断固定位置密度，因为密度还会随位置搬运；沿轨迹的对数密度变化才由 $-\divg v_t$ 控制。
+
+给定一条密度路径，速度未必唯一。在 $d\ge2$ 的区域，如果向量场 $w_t$ 满足 $\divg(p_tw_t)=0$，那么 $v_t+w_t$ 产生相同密度变化。例如径向对称密度下的绕中心旋转，可以改变粒子轨迹而不改变密度。概率流 ODE 提供一个由前向 SDE 自然导出的选择，并不是唯一可能的确定性生成机制。
+
+\subsection{速度场与 score 为什么不是同一个概念}
+Score 是密度对数的梯度；光滑情况下其旋度为零。速度场只需满足概率输运的要求，并不必是某个标量势函数的梯度。概率流速度包含前向漂移 $f$，若 $f$ 自身具有旋转部分，整体速度就可能不是梯度场。流匹配也不要求网络速度是保守场。
+
+在不同噪声尺度或路径上把 score 转换成速度，需要知道日程系数；式\eqref{eq:pfode}和式\eqref{eq:gaussian-path-velocity}正是这样的转换。一个张量的形状相同，不能证明它们具有相同意义。$\epsilon_\theta$、$s_\theta$、$v_\theta$ 和 $u_\theta$ 都可以是 $d$ 维向量，区别在于监督、单位与放入生成方程的方式。
+
+如果密度路径具有对称性，某些速度的旋转部分可能不改变任何单时刻密度，但会改变起点到终点的配对。这说明生成建模既有分布层面，也有输运几何层面。讨论编辑、反演与保持身份时，后一层往往变得特别重要；仅用“终点分布接近”描述这些任务并不充分。
+
+\subsection{确定性为何仍然可以有多样性}
+ODE 在给定初始点时通常是确定性的。但初始点从 $\N(0,I)$ 随机抽取，不同初始点被流映射到不同的最终点。整体分布是一个随机起点分布的\term{推前}{gl:transport}。随机性可以集中在起点，也可以沿 SDE 路径持续注入；两者都可以生成多样本。
+
+若 ODE 在整个闭区间满足足够强的可逆流条件，光滑正密度不会在有限时间内精确坍缩到严格低维流形。因此现实生成中所谓“回到数据流形”通常是近似或正噪声平滑意义上的说法。对奇异数据分布，要么保留一个小噪声端点，要么允许端点速度失去正则性，不能同时宣称处处正则可逆与精确奇异终点。
+
+\subsection{沿 ODE 计算似然}
+将连续性方程展开为
+\begin{equation}
+ \partial_t p_t+v_t\cdot\grad p_t+p_t\divg v_t=0.
+\end{equation}
+沿满足 $\dot x_t=v_t(x_t)$ 的轨迹使用链式法则，得到
+\begin{equation}
+ \frac{\dd}{\dd t}\log p_t(x_t)=-\divg v_t(x_t).
+\end{equation}
+把数据点从 $0$ 积分到简单端 $1$，因此
+\begin{equation}
+ \log p_0(x_0)=\log p_1(x_1)+\int_0^1\divg v_t(x_t)\dd t.
+ \label{eq:cnf-likelihood}
+\end{equation}
+这个正号可以通过“扩张会降低沿轨迹密度”核查。对神经网络速度场，散度是 Jacobian 的迹。高维下可以用满足 $\E[\xi\xi^\top]=I$ 的随机向量估计：
+\begin{equation}
+ \E_\xi\left[\xi^\top(\partial_xv_t)\xi\right]=\tr(\partial_xv_t).
+\end{equation}
+无需构造完整 $d\times d$ Jacobian，向量积可通过自动微分计算。有限次迹估计有随机误差，数值积分有离散误差；“连续流有精确变化量公式”与“实际计算完全无误差”要分开。
+
+还有一处边界：代入近似 $s_\theta$ 之后，神经 ODE 自身定义了一个生成密度 $p_\theta^{\mathrm{ODE}}$，可以用该变化量公式计算它的似然。但该 ODE 与使用同一个近似 score 的 SDE 不必仍然共享精确边缘，也不必等于真实数据密度。理想等价关系不能替代训练误差分析。
+
+\section{Flow Matching：直接学习搬运概率的速度}\label{sec:flowmatching}
+\subsection{换一个问题：不先规定随机加噪链}
+现在使用 $\tau\in[0,1]$，方向为噪声到数据。抽取 $Z\sim\pnoise$ 和 $X\sim\pdata$，先用独立\term{耦合}{gl:coupling} $\pi(z,x)=\pnoise(z)\pdata(x)$。定义线性插值
+\begin{equation}
+ Y_\tau=(1-\tau)Z+\tau X,\qquad \dot Y_\tau=X-Z.
+ \label{eq:linear-interpolant}
+\end{equation}
+我们可以直接抽到 $Y_\tau$ 和对应的条件速度标签 $X-Z$，不需要数值求解一条当前网络轨迹。能否用这样的局部监督学到真正生成整个分布的 ODE？Flow Matching 的核心答案是可以\cite{r_fm}。
+
+首先，不同 $(Z,X)$ 对的直线会相交。在相同位置 $y$ 和时刻 $\tau$，不同配对可能要求不同速度。单个网络 $u_\theta(y,\tau)$ 只能输出一个向量。因此它必须学到一个对相交路径进行平均的边缘速度：
+\begin{equation}
+ u_\tau(y)=\E[X-Z\mid Y_\tau=y].
+ \label{eq:marginal-velocity}
+\end{equation}
+这个平均为何正确，不能只凭“看起来合理”接受。
+
+\subsection{用测试函数证明边缘速度搬运了所需密度}
+对紧支撑光滑测试函数 $\varphi$，在可交换微分与期望的条件下，
+\begin{align}
+ \frac{\dd}{\dd\tau}\E[\varphi(Y_\tau)]
+ &=\E[\grad\varphi(Y_\tau)\cdot(X-Z)]\\
+ &=\E[\grad\varphi(Y_\tau)\cdot u_\tau(Y_\tau)]\\
+ &=\int\grad\varphi(y)\cdot u_\tau(y)p_\tau(y)\dd y\\
+ &=-\int\varphi(y)\divg(p_\tau(y)u_\tau(y))\dd y.
+\end{align}
+所以 $p_\tau$ 以弱形式满足
+\begin{equation}
+ \partial_\tau p_\tau+\divg(p_\tau u_\tau)=0.
+\end{equation}
+若满足适当的正则性与唯一性，从 $Y_0\sim\pnoise$ 解 ODE $\dot y=u_\tau(y)$，就得到所需边缘路径，终点分布为 $\pdata$。端点可能需要取极限；弱形式允许我们先讨论随机变量的分布，而不强迫每条确定性条件路径拥有普通密度。
+
+这个证明有一个很有力量的地方：ODE 的生成轨迹不必沿着训练时某个配对的直线。它只需要让所有粒子的分布在每个时刻正确。条件标签可能互相冲突，条件均值恰好化解了冲突，并保留整体概率守恒。
+
+\subsection{为什么条件流匹配能训练边缘速度}
+给网络使用可计算目标
+\begin{equation}\boxed{
+ L_{\mathrm{CFM}}=\E_{\tau,(Z,X)\sim\pi}
+ \norm{u_\theta(Y_\tau,\tau)-(X-Z)}^2.
+ }\label{eq:cfm}\end{equation}
+假设 $\E\norm{X-Z}^2<\infty$，令 $V=X-Z$，再次使用条件投影恒等式：
+\begin{align}
+ L_{\mathrm{CFM}}
+ &=\E_{\tau,Y_\tau}\norm{u_\theta(Y_\tau,\tau)-u_\tau(Y_\tau)}^2\\
+ &\quad+\E_{\tau,Z,X}\norm{V-u_\tau(Y_\tau)}^2.
+\end{align}
+第二项不依赖参数。于是可观测的条件速度回归，与不可直接计算的边缘速度回归，具有相同最优解和梯度（在可交换微分与期望的条件下）。这与去噪 score matching 的数学骨架完全相同：用条件目标的样本监督，通过条件均值得到边缘对象。
+
+\begin{intuitionbox}{两个无法直接获得的教师}
+扩散无法直接告诉我们边缘密度的 score，但能提供条件核的 score；流匹配无法直接告诉我们整体边缘速度，但能提供配对插值的速度。平方损失使神经网络学会后验平均，而这一平均分别满足正确的密度梯度关系与连续性方程。这是“只凭样本训练生成规则”的共同桥梁。
+\end{intuitionbox}
+
+\subsection{耦合为什么改变难度，却不改变端点}
+只要 $\pi$ 的两个边缘仍是 $\pnoise$ 和 $\pdata$，插值的端点就不变。但中间密度、路径交叉程度、条件标签方差和 ODE 轨迹都依赖 $\pi$。独立配对容易抽样，却可能使许多相反方向在同一位置竞争。
+
+若选取或近似一个较好的输运耦合，可以减少不必要的长途搬运或冲突。但必须区分几种说法：“端点之间每条条件路径是直线”，不等于“边缘 ODE 轨迹是直线”，更不等于“已经找到全局最优输运”。最优输运还需要明确代价函数，并对所有具有指定边缘的耦合优化。Flow Matching 中某些条件路径的最优性质，不能无条件提升为全局边缘耦合最优性质。
+
+Rectified Flow 与 reflow 会利用模型产生的噪声、数据配对重新训练速度场。它们怎样使路径趋向易于积分的形状，第三章会解释；这里要带走的是：耦合是一种训练自由度，与网络结构和数值求解器属于不同层面。
+
+\subsection{高斯条件路径的通用速度}
+回到数据到噪声的时钟 $t$，固定数据 $x_0$，采用 $x_t=a(t)x_0+b(t)Z$。条件曲线导数为 $a'x_0+b'Z$。在条件密度 $q_t(x\mid x_0)$ 中，$Z=(x-a x_0)/b$，故条件速度可写为
+\begin{equation}
+ w_t(x\mid x_0)=a'x_0+\frac{b'}b(x-a x_0),\quad b>0.
+\end{equation}
+边缘速度是 $w_t$ 的条件平均。利用式\eqref{eq:tweedie}和 $\E[Z\mid x_t=x]=-bs_t(x)$，得到
+\begin{equation}\boxed{
+ w_t(x)=\frac{a'}a x+\left(\frac{a'}a b^2-bb'\right)s_t(x),\quad a,b>0.
+ }\label{eq:gaussian-path-velocity}\end{equation}
+这个公式连接了 Gaussian Flow Matching 与 diffusion。若前向线性 SDE 的漂移为 $f(x,t)=\gamma(t)x$，其中 $\gamma=a'/a$，条件方差满足
+\begin{equation}
+ (b^2)'=2\gamma b^2+g^2,
+\end{equation}
+那么 $\gamma b^2-bb'=-g^2/2$，式\eqref{eq:gaussian-path-velocity}正是概率流 ODE 的速度。相同的概率路径可以通过 score 训练，也可以通过条件速度训练；训练参数化和损失权重仍需转换。
+
+反过来，不是所有任意选择的 $a,b$ 都对应一个可用的前向加噪 SDE：计算出的 $g^2=(b^2)'-2(a'/a)b^2$ 必须非负，并满足相应正则性。流匹配不要求先找到这个非负扩散系数，因此可以使用更宽的路径家族。随机插值框架还把概率输运与扩散进一步联系起来\cite{r_stochasticinterpolants}。
+
+\section{条件生成与引导：怎样改变概率方向}\label{sec:guidance}
+\subsection{条件 score 的贝叶斯分解}
+给定条件 $c$，例如类别或文本，直接训练条件模型学 $s_t(x\mid c)$ 是最自然的做法。若另有噪声状态上的分类器 $p_t(c\mid x)$，贝叶斯公式给出
+\begin{equation}
+ \grad_x\log p_t(x\mid c)=s_t(x)+\grad_x\log p_t(c\mid x).
+ \label{eq:classifier-guidance}
+\end{equation}
+$\log p(c)$ 对 $x$ 的梯度为零。分类器必须在相应噪声分布上有意义；把只见过干净图像的分类器直接用于高噪声输入，不满足这个要求。
+
+条件 score 已经包含某个条件的真实统计规律。为什么还要额外放大条件方向？真实数据里的图文配对可能不够紧，模型也有误差；实际用户往往希望图像更强地表达条件。于是引导允许生成过程偏离普通条件抽样，换取更明显的条件遵循。
+
+\subsection{Classifier-free guidance 的数学形式}
+训练时以一定概率丢弃条件，用同一网络学习条件预测和空条件预测。采用本书约定，令引导尺度 $w$ 满足
+\begin{equation}\boxed{
+ s^{\mathrm{CFG}}(x,t,c)
+ =s_\theta(x,t,\varnothing)+w\left[s_\theta(x,t,c)-s_\theta(x,t,\varnothing)\right].
+ }\label{eq:cfg}\end{equation}
+$w=0$ 是无条件；$w=1$ 是普通条件；$w>1$ 外推条件方向\cite{r_cfg}。有的论文把 $s_c+\omega(s_c-s_u)$ 写成引导，这时 $w=1+\omega$。比较“引导值等于多少”之前，要先比较公式。
+
+若两个 score 都精确，对于某个固定时刻，式\eqref{eq:cfg}形式上等于以下未归一化密度的 score：
+\begin{equation}
+ \widetilde p_t(x\mid c)\propto p_t(x\mid c)^w p_t(x)^{1-w}.
+\end{equation}
+利用贝叶斯也可写成 $p_t(x)p_t(c\mid x)^w$ 乘以与 $x$ 无关的因子。这给出“增强条件相关位置”的直觉，但需要右边可积；更重要的是，逐个时刻定义出的 $\widetilde p_t$ 一般不自动构成原前向 SDE 的一致边缘路径。因此不能据此声称最终生成密度严格等于 $p_0(x\mid c)^w/p_0(x)^{w-1}$。引导系统的全程分布还受动力学与数值积分影响。
+
+在相同线性参数化下，噪声、$v$ 或流速度预测也可作同样的条件、空条件线性组合。不过对一般流匹配速度，不能直接将它解释为某个 log density 的梯度；该组合是改变输运场，不等于自动获得新的解析目标密度。
+
+\begin{cautionbox}{更强条件与更好生成不是同一个量}
+大引导可能增强文本吻合，也可能放大预测误差、削弱多样性或导致过饱和。理论上的条件梯度方向给出机制解释，却不保证任意尺度都稳定。第\ref{ch:applications}章还会区分语义条件、空间控制、编辑约束及其不同信息通道。
+\end{cautionbox}
+
+\section{把理想方程接回真实模型}
+\subsection{把概率路径与样本路径再分开一次}
+现在我们拥有三种很容易写成同一形式的对象：SDE 的随机样本路径、为了回归而构造的 $a(t)x_0+b(t)Z$ 条件曲线，以及生成 ODE 的积分轨迹。它们可以拥有相同的单时刻边缘密度，却有不同的联合分布和不同的端点耦合。
+
+前向 SDE 的噪声在时间上持续注入；用同一份 $Z$ 构造条件曲线时，所有时刻的噪声完全相关；概率流 ODE 只在初始条件中使用随机性，之后按一个固定场移动。选择它们中的哪一种，不仅影响采样的外观，也影响你是否能把某个中间状态与某个原始端点唯一对应。
+
+\begin{examplebox}{同一个标准高斯边缘也可以有不同耦合}
+设 $Z,E$ 是独立标准高斯。过程 $X_t=Z$ 在所有时刻不动；过程 $Y_t=\cos(t)Z+\sin(t)E$ 在每个时刻也都是标准高斯。二者的边缘相同，但
+$\E[X_sX_t]=1$，而 $\E[Y_sY_t]=\cos(t-s)$。如果只保存每个时刻的样本直方图，你看不出这种差别；若保存轨迹或配对，差别就清晰了。
+\end{examplebox}
+
+这个例子不是新的扩散采样器，只是说明边缘信息不足以确定路径。训练只要能够获得所需的单时刻监督，就可能使用不同的人工构造；生成是否正确则需要相应的动力学证明，不能只因边缘形式相像就把算法互换。
+
+\subsection{终点与中间点的生成要求并不一样}
+如果只要求最终分布正确，原则上允许很多不同中间路径。若还要求每个中间状态都具有指定噪声语义、能与一个既有 score 网络兼容，那么路径自由度就减少。一个预先训练的 DDPM 网络不能不经转换便在任意 Flow Matching 路径上使用，因为它学习的是自己训练日程里的条件统计。
+
+同样，在同一条路径上更换求解器，通常可以复用网络，但仍需保持时间嵌入、输入缩放、预测目标和终点处理一致。将“训练规则允许不模拟当前网络轨迹”理解为“采样时也不需要积分”是另一种常见混淆。CFM 在训练时不需要反向穿过 ODE 求解器；生成时仍须求解学到的场，除非再训练一个一步或少步生成机制。
+
+\subsection{一个最小的数学实现清单}
+在真正写代码前，可以用六句话明确模型。数据在什么空间、采用什么尺度？概率路径的起点与终点是什么？随机训练样本怎样构造？网络预测的是哪个可观测条件标签？预测值如何转换成生成动力学？时间区间与端点怎样离散化？如果这些问题没有明确答案，增加复杂网络也只会把错误隐藏得更深。
+
+以直线 CFM 为例：在选定的连续表示里，抽独立 $Z,X$；抽 $\tau$；形成 $Y_\tau$；回归 $X-Z$；从 $Z$ 解 $\dot Y=u_\theta(Y,\tau)$；采用合适时间网格到 $\tau=1$。以 VP score 生成而言：形成 $x_t=ax_0+b\epsilon$；回归 $-\epsilon/b$ 或等价噪声标签；明确 $f,g$；将预测代入反向 SDE 或概率流 ODE；从简单端向较小的 $t$ 积分。所有公式里相同的符号必须对应相同的日程与坐标尺度。
+
+\subsection{四层误差分别来自哪里}
+第一层是数据与表示：有限训练集、筛选偏差、量化像素、隐空间压缩决定了可学的对象。第二层是终点与路径：若噪声端仍残留数据结构，而生成起点采用标准高斯，就存在先验失配。第三层是统计学习：有限容量和优化使 $s_\theta$ 或 $u_\theta$ 偏离理想场。第四层是数值求解：有限步 ODE/SDE 近似产生额外偏差。
+
+它们不会因为同一个公式推导正确而消失。模型提高容量未必修复一个错误日程；求解器增加阶数未必修复错误速度场；引导增强语义也可能加重积分难度。第三章的方法比较将沿这些轴线组织。
+
+\subsection{为什么小的局部回归误差仍可能重要}
+设真实 ODE 速度 $u$ 在状态上具有 Lipschitz 常数 $L$，估计场为 $u_\theta$。从相同起点出发，令轨迹误差 $e(\tau)=y_\theta(\tau)-y(\tau)$，有
+\begin{align}
+ \frac{\dd}{\dd\tau}\norm{e(\tau)}
+ &\le L\norm{e(\tau)}+
+ \norm{u_\theta(y_\theta(\tau),\tau)-u(y_\theta(\tau),\tau)}.
+\end{align}
+形式上应用 Gr\"onwall 不等式，得到
+\begin{equation}
+ \norm{e(1)}\le\int_0^1e^{L(1-r)}
+ \norm{u_\theta(y_\theta(r),r)-u(y_\theta(r),r)}\dd r.
+\end{equation}
+它说明误差会沿路径累积，并可能被场的敏感性放大。但训练损失是在目标边缘上取平均，右边却沿模型轨迹计算；没有额外的覆盖、稳定性或一致误差条件，不能直接把一个小训练损失宣称为严格的小终点误差。这就是分布偏移在生成过程中的一种体现。
+
+\subsection{一个统一图景}
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[>=Latex,
+ box/.style={draw=teal!60,fill=teal!4,rounded corners=1pt,text width=61mm,align=center,inner sep=7pt,font=\small}]
+\node[box] (samples) at (0,0) {数据样本与人为选定的概率路径};
+\node[box] (score) at (-3.6,-2.5) {可计算条件 score\\平方回归得到边缘 score};
+\node[box] (velocity) at (3.6,-2.5) {可计算条件速度\\平方回归得到边缘速度};
+\node[box] (sde) at (-3.6,-5) {反向 SDE\\随机粒子动力学};
+\node[box] (ode) at (3.6,-5) {生成 ODE\\确定性粒子动力学};
+\node[box] (density) at (0,-7.5) {概率守恒方程\\目标边缘分布};
+\draw[->,teal] (samples)--(score);\draw[->,teal](samples)--(velocity);
+\draw[->,teal](score)--(sde);\draw[->,teal](velocity)--(ode);
+\draw[->,gold](score.east)--node[above,font=\scriptsize]{概率流}(ode.north west);
+\draw[->,teal](sde)--(density);\draw[->,teal](ode)--(density);
+\end{tikzpicture}
+\caption{本章的逻辑关系。score 与条件速度给出不同可训练入口；是否共享一条边缘路径，取决于路径和系数的匹配条件。}\label{fig:math-unified}
+\end{figure}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{p{24mm}YYY}\toprule
+入口 & 可观测监督 & 理想边缘对象 & 生成规则\\\midrule
+DDPM & 注入噪声 $\epsilon$ & $\E[\epsilon\mid x_k]$ & 学得的高斯逆转移\\
+Score matching & 条件核梯度 & $\grad\log p_t$ & 反向 SDE 或概率流 ODE\\
+Flow Matching & 条件路径导数 & $\E[\dot Y_\tau\mid Y_\tau]$ & 速度场 ODE\\\bottomrule
+\end{tabularx}
+\caption{同一个条件投影原理的三种入口。路径、目标与求解器的关系需要逐项检查。}
+\end{table}
+
+\section{练习与解答思路}
+\begin{exercisebox}{2.1\quad 终点与信噪比}
+设一维数据均值为 $2$、方差为 $4$，且 $\bar\alpha_K=0.01$。求 $x_K$ 的均值和方差；仅凭这两个量能否断定它是高斯？
+\end{exercisebox}
+\textbf{解答思路。}均值为 $0.2$，方差为 $0.01\times4+0.99=1.03$。不能断定高斯；高斯混合与单高斯可以拥有相同均值、方差。终点近似还需要考虑高阶结构与所用误差尺度。
+
+\begin{exercisebox}{2.2\quad 条件回归的不可消除误差}
+给定 $U$，监督 $V$ 以相同概率等于两个向量 $v_1,v_2$。求平方回归最优输出及最小条件损失。解释它与流匹配相交直线的关系。
+\end{exercisebox}
+\textbf{解答思路。}最优输出为 $(v_1+v_2)/2$，最小损失为 $\norm{v_1-v_2}^2/4$。边缘速度可以正确，条件标签损失却不为零；交叉的训练直线无需由网络逐条复现。
+
+\begin{exercisebox}{2.3\quad 检查概率流系数}
+数据为标准高斯，前向 SDE 为 $\dd x=-\beta x\dd t/2+\sqrt\beta\dd W$。若生成时直接删掉反向 SDE 的噪声，保留其漂移，得到的 ODE 是否保持标准高斯？
+\end{exercisebox}
+\textbf{解答思路。}真实 score 为 $-x$。反向时钟下删噪后的漂移为 $-\beta x/2$，样本向零收缩，方差不恒定。概率流需要 $g^2/2$ 的系数，才得到零速度。
+
+\begin{exercisebox}{2.4\quad 直线流匹配的高斯解析解}
+设 $Z\sim\N(0,I)$，$X\sim\N(m,cI)$，两者独立。求 $Y_\tau$ 的均值、方差，以及边缘速度 $\E[X-Z\mid Y_\tau=y]$。
+\end{exercisebox}
+\textbf{解答思路。}均值 $\tau m$，方差 $h(\tau)I$，其中 $h=(1-\tau)^2+\tau^2c$。联合高斯条件公式给出
+\begin{equation}
+ u_\tau(y)=m+\frac{\tau c-(1-\tau)}{h(\tau)}(y-\tau m)
+ =m+\frac{h'(\tau)}{2h(\tau)}(y-\tau m).
+\end{equation}
+每条 ODE 轨迹满足 $y_\tau=\tau m+\sqrt{h(\tau)}z$。它通常不是训练配对的直线，却具有完全正确的边缘。这是可以直接代入验证的解析例子。
+
+\begin{exercisebox}{2.5\quad 参数化改变了什么}
+当 $a^2+b^2=1$ 时，证明从 $v$ 误差得到的原图误差为 $-b$ 倍，噪声误差为 $a$ 倍。讨论 $a\to0$ 与 $b\to0$ 时的数值意义。
+\end{exercisebox}
+\textbf{解答思路。}由式\eqref{eq:vconversion}立即得到。两个转换系数有界，而噪声、原图之间直接相互转换含 $a/b$ 或 $b/a$。这只说明转换的条件性更好，不构成任意训练设置下 $v$ 一定最佳的证明。
+
+\chaptertakeaway{扩散模型的数学并非只有“加噪，再减噪”。高斯条件核提供可计算监督；条件期望把监督转化成边缘 score 或边缘速度；Fokker--Planck 与连续性方程解释这些场如何搬运整个概率分布。反向 SDE 和概率流 ODE 共享理想边缘而不共享轨迹；流匹配把相同的条件投影思想推广到直接设计的输运路径。下一章将用这张关系网理解具体算法，而不是记忆互不相连的名字。}

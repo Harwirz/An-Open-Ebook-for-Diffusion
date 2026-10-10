@@ -1,0 +1,119 @@
+\chapter{术语词典与回读入口}\label{app:glossary}
+术语按理解依赖组织，中文名称后给出常见英文写法。正文中的青绿色术语会跳转到这里。每组末尾提供回到相关正文的链接；PDF 阅读器的“上一视图”也可直接返回原位置。
+
+\section{分布、几何与统计}
+\subsection*{分布（distribution）}\label{gl:distribution}
+随机变量落在各集合中的概率规律。对图像而言，分布既约束颜色、纹理，也约束形状、空间关系及它们的组合。学习分布不是把每张训练图都编码成一个文件；生成只要求新随机样本具有相应统计规律。回读：第\ref{ch:concepts}章、附录\ref{app:probability}。
+
+\subsection*{密度（probability density）}\label{gl:density}
+将区域概率写为体积积分时的被积函数。密度值不是单点概率，也可能大于 $1$。有些分布，例如严格集中在低维集合上的分布，没有相对于全空间体积的密度。回读：附录\ref{app:probability}。
+
+\subsection*{条件与条件分布（conditioning）}\label{gl:conditional}
+在已知某些信息之后，对其余随机对象的概率规律进行更新。例如 $p(x\mid c)$ 表示给定文本或类别后的图像分布。这里的“条件”不一定是训练代码里拼接的一个向量；如何编码和注入它，是网络设计问题。回读：第\ref{sec:guidance}节。
+
+\subsection*{流形（manifold）}\label{gl:manifold}
+在局部可以用较少坐标描述的几何空间。自然图像位于“数据流形附近”是解释高维结构的有用假设，而不是已经证明所有真实图像都严格落在某个光滑低维流形上。噪声会使原本集中的分布铺开，从而得到普通密度与可学习的 score。回读：第\ref{ch:concepts}章。
+
+\subsection*{隐变量与隐空间（latent variable / latent space）}\label{gl:latent}
+概率模型中的隐变量是未被直接观测、却参与生成或推断的变量；随机生成起点、DDPM 的辅助含噪轨迹、编码器得到的压缩表示，是不同的具体用法。隐空间指这些变量所在的表示空间，在隐空间扩散中通常特指自编码器的内部表示。它可以比像素空间维度低，但低维不自动意味着每一维都可解释为某个语义。隐空间扩散学习编码后分布，最后用解码器恢复可见数据。回读：第\ref{ch:concepts}章、第\ref{ch:applications}章。
+
+\subsection*{似然（likelihood）}\label{gl:likelihood}
+已观测样本作为固定输入，密度或概率质量作为参数的函数。它衡量模型给数据赋予的统计支持，不直接等于审美质量或提示词遵循。连续图像的似然报告还要明确去量化、归一化和维度。回读：第\ref{sec:ddpm-elbo}节、式\eqref{eq:cnf-likelihood}。
+
+\subsection*{KL 散度（Kullback--Leibler divergence）}\label{gl:kl}
+$\KL(q\Vert p)=\E_q\log(q/p)$，比较两个概率规律。它非负、不对称，支撑不匹配时可能无穷。优化哪个方向的 KL 会影响对漏掉模式和分配错误概率的惩罚。回读：附录\ref{app:probability}。
+
+\subsection*{ELBO（evidence lower bound）}\label{gl:elbo}
+对隐藏变量模型的对数似然给出的可优化下界。下界差距为辅助后验与模型后验的 KL。DDPM 用完整前向含噪轨迹作为辅助后验；简单噪声损失是对原变分目标重新加权后的训练选择。回读：第\ref{sec:ddpm-elbo}节。
+
+\subsection*{熵（entropy）}\label{gl:entropy}
+度量分布不确定性或平均信息量的一种统计量。连续微分熵依赖坐标尺度，不同于离散熵。纯加性高斯平滑在适当条件下使微分熵增大；带漂移的扩散不能据此无条件断言熵单调增加。回读：附录\ref{app:proofs}。
+
+\subsection*{信噪比（signal-to-noise ratio, SNR）}\label{gl:snr}
+在 $x_t=ax_0+b\epsilon$ 的日程表示里常指 $a^2/b^2$。它表示信号与噪声的系数尺度比；数据方差不均匀时，不同方向的实际信息保留量仍不同。log-SNR 常用于时间参数化与损失权重分析。回读：第\ref{sec:parameterization}节。
+
+\subsection*{重参数化（reparameterization）}\label{gl:reparameterization}
+将复杂随机变量写成简单噪声的可微确定性变换。例如直接构造 $x_k=\sqrt{\bar\alpha_k}x_0+\sqrt{1-\bar\alpha_k}\epsilon$。它使训练能随机抽取时刻，而不必模拟完整前向链。回读：式\eqref{eq:forward-marginal}。
+
+\section{动力学、输运与训练}
+\subsection*{Markov 性（Markov property）}\label{gl:markov}
+给定当前状态后，未来条件分布不再依赖更早历史。DDPM 前向链具有这一性质；DDIM 的辅助联合构造可以改变多时刻依赖，而保留训练所需的单时刻边缘。回读：第\ref{ch:methods}章。
+
+\subsection*{Score（状态的对数密度梯度）}\label{gl:score}
+$s_t(x)=\nabla_x\log p_t(x)$。它是状态空间的向量场，区别于对参数求导的统计 score。高斯条件核的 score 可计算，条件均值则给出未知边缘 score。它不等于图像质量函数。回读：第\ref{sec:score}节。
+
+\subsection*{ODE（ordinary differential equation）}\label{gl:ode}
+普通微分方程，用速度场和初始位置确定连续轨迹。给定噪声起点后，生成轨迹可以确定；随机起点仍使最终输出具有多样性。回读：第\ref{sec:pfode}节、附录\ref{app:stochastic}。
+
+\subsection*{SDE（stochastic differential equation）}\label{gl:sde}
+随机微分方程，在漂移之外还由布朗增量驱动。它是积分方程的简写，不能把噪声项视为普通可微函数。扩散生成使用正确的时间反向 SDE，逆漂移包含边缘 score。回读：第\ref{sec:sde}节。
+
+\subsection*{布朗运动（Brownian motion）}\label{gl:brownian}
+连续的随机过程，独立增量的方差与时间间隔成正比。它的小步典型尺度是时间间隔的平方根，路径几乎必然不可按普通方式求导。回读：附录\ref{app:stochastic}。
+
+\subsection*{It\^o 公式（It\^o formula）}\label{gl:ito}
+随机过程上的链式法则。与普通链式法则相比，多了由布朗二次变差产生的二阶项。正是这个项让 SDE 的密度方程包含扩散与 $1/2$ 系数。回读：第\ref{sec:sde}节、附录\ref{app:stochastic}。
+
+\subsection*{Fokker--Planck 方程}\label{gl:fp}
+描述 SDE 所诱导密度随时间变化的偏微分方程。对于状态无关标量扩散，$\partial_tp=-\nabla\cdot(fp)+g^2\Delta p/2$。它把粒子的随机运动转成整体密度演化。回读：式\eqref{eq:fokker-planck}。
+
+\subsection*{连续性方程（continuity equation）}\label{gl:continuity}
+表达输运中的概率质量守恒：$\partial_tp+\nabla\cdot(pu)=0$。局部概率减少对应净流出，不是概率消失。概率流 ODE 与流匹配都使用这一关系。回读：第\ref{sec:pfode}、\ref{sec:flowmatching}节。
+
+\subsection*{散度（divergence）}\label{gl:divergence}
+向量场各分量对对应坐标偏导之和，$\nabla\cdot v=\sum_i\partial_iv_i$。它描述局部体积膨胀率；沿 ODE 轨迹的对数密度变化为负散度。概率流密度的散度 $\nabla\cdot(pv)$ 与速度散度不同。回读：式\eqref{eq:cnf-likelihood}。
+
+\subsection*{Jacobian（雅可比矩阵）}\label{gl:jacobian}
+向量函数的一阶偏导矩阵。其行列式描述局部体积缩放，迹在同维速度场中给出散度。连续归一化流将离散变换的行列式计算转化为沿时间积分散度。回读：附录\ref{app:proofs}。
+
+\subsection*{Lipschitz 条件}\label{gl:lipschitz}
+用 $\norm{v(x)-v(y)}\le L\norm{x-y}$ 控制函数对输入变化的敏感性。局部 Lipschitz 有助于 ODE 解唯一；与增长条件配合可防止有限时间爆炸。神经场的实际 Lipschitz 行为也影响误差放大。回读：附录\ref{app:stochastic}。
+
+\subsection*{刚性（stiffness）}\label{gl:stiffness}
+动力学中不同变化尺度相差很大，使某些显式数值方法为了稳定而不得不用很小步长的现象。高阶不自动解决刚性，也不自动消除网络误差。回读：附录\ref{app:stochastic}、第\ref{ch:methods}章。
+
+\subsection*{耦合（coupling）}\label{gl:coupling}
+具有给定两个边缘分布的联合分布。耦合决定噪声与数据如何配对；改变配对可能改变流匹配的中间路径和学习难度，而端点边缘保持相同。回读：第\ref{sec:flowmatching}节。
+
+\subsection*{概率输运与推前（transport / pushforward）}\label{gl:transport}
+用映射或动力学把一份概率分布搬成另一份。推前记作 $T_\#p$；最优输运另有指定代价的最小化要求，不能把任意直线插值都称为全局最优。回读：附录\ref{app:probability}。
+
+\subsection*{桥（bridge）}\label{gl:bridge}
+带有端点或端点分布约束的路径建模。不同论文的桥可能指条件随机桥、Schr\"odinger bridge 或其他输运构造，不能只因“连接两端”就视为同一种算法。阅读时应检查参考过程、耦合、路径随机性与优化目标。回读：第\ref{ch:methods}章。
+
+\subsection*{CFG（classifier-free guidance）}\label{gl:cfg}
+组合条件预测和空条件预测来增强条件影响。训练常用条件丢弃获得两种预测。引导改变生成场，并可能改变多样性、稳定性和条件遵循；引导尺度的数值必须连同公式约定比较。回读：第\ref{sec:guidance}节。
+
+\subsection*{蒸馏（distillation）}\label{gl:distillation}
+利用较强或较慢教师的输出、轨迹或预测训练更便宜的学生。少步生成可以通过蒸馏得到，但“减少采样步数”也可由求解器改进实现；两者的训练成本与误差来源不同。回读：第\ref{ch:methods}章。
+
+\section{生成模型与网络组件}
+\subsection*{VAE（variational autoencoder）}\label{gl:vae}
+用隐变量、编码器近似后验和解码器构成生成模型，并优化变分下界。隐空间扩散的自编码器是表示工具，扩散先验则建模编码后的分布；两部分职责不同。回读：第\ref{ch:concepts}章。
+
+\subsection*{GAN（generative adversarial network）}\label{gl:gan}
+用生成器与判别器的对抗训练学习分布匹配。通常采样很快，直接密度求值却不容易；稳定性与模式覆盖依赖具体目标和训练方法。它同样从随机噪声生成图像，不能把“用噪声作起点”视为扩散独有性质。回读：第\ref{ch:concepts}章。
+
+\subsection*{归一化流（normalizing flow）}\label{gl:flow}
+利用可逆变换及变化量公式构造可计算密度的模型。连续流以 ODE 表示变换，沿轨迹积分散度计算密度。Flow Matching 是训练连续流的一类方式，而非与所有 flow 模型无关的名称。回读：第\ref{ch:concepts}章、第\ref{sec:flowmatching}节。
+
+\subsection*{自回归（autoregressive, AR）}\label{gl:ar}
+把联合概率分解为有序条件概率乘积，例如 $p(x)=\prod_ip(x_i\mid x_{<i})$。可以用于像素、离散视觉 token 或文本。自回归规定因子分解，Transformer 是网络结构；两者不是同义词。回读：第\ref{ch:concepts}章。
+
+\subsection*{注意力（attention）}\label{gl:attention}
+通过 query 与 key 的相关性计算权重，再对 value 汇总信息。自注意力让同一组位置交换信息；交叉注意力让一组位置读取另一组信息，例如图像读取文本。注意力的作用来自信息路由，不等于模型已经学会真实物理因果关系。回读：第\ref{ch:applications}章。
+
+\subsection*{Token（处理单元）}\label{gl:token}
+网络输入序列中的一个单元。文本 token 常为词片段或离散符号；视觉 token 可以是连续 patch 向量，并不一定是离散词表索引。多模态系统把不同模态组织成 token 后，仍要设计它们的空间位置、时间位置及注意力约束。回读：第\ref{ch:applications}章。
+
+\subsection*{Patch（局部块）}\label{gl:patch}
+把图像或隐空间网格切成局部小块，再映射成序列向量。patch 大小影响 token 数、计算成本和细节表达。DiT 可以在连续隐空间 patch 上处理扩散或流速度预测，不能仅因 patch 化就称其为离散扩散。回读：第\ref{ch:applications}章。
+
+\subsection*{感知损失（perceptual loss）}\label{gl:perceptual}
+在预训练特征空间里比较图像，而不只比较像素。它能更关注某些可见结构，但会继承特征提取器的偏好；低感知损失不代表所有信息无损保存。隐空间自编码器的压缩质量决定生成系统能够恢复的细节上限。回读：第\ref{ch:applications}章。
+
+\subsection*{等变性（equivariance）}\label{gl:equivariance}
+输入经过某种变换后，输出按相应方式变化，例如旋转分子后预测坐标也随之旋转。它与不变性不同：不变输出完全不变。科学与三维生成常需要这样的结构约束来提高数据效率与物理一致性。回读：第\ref{ch:applications}章。
+
+\subsection*{FID（Fr\'echet Inception Distance）}\label{gl:fid}
+在某个特征空间中，以均值与协方差的高斯近似比较真实和生成样本集。它是集合统计指标，受特征提取器、样本量与评估协议影响；不能直接衡量某张图的质量，也不能单独衡量文本准确性、物理合理性或安全性。回读：第\ref{ch:applications}章的评价讨论。

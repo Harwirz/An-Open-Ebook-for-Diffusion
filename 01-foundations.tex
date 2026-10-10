@@ -1,0 +1,174 @@
+\chapter{概率工具：读懂分布与回归}\label{app:probability}
+这个附录不是概率论的完整替代，而是正文使用的工具箱。每个概念都围绕扩散模型里的具体用法展开。读到某个式子卡住时，可以先查对应工具，再返回原文。
+
+\section{随机变量、分布与密度}
+随机变量是从随机结果到数值或向量的映射。例如抽取一张训练图像，把它展平成 $d$ 维向量，便得到随机向量 $X$。分布告诉我们 $X$ 落在一个集合 $A$ 中的概率，记为 $P(X\in A)$。分布可以存在而没有相对于普通体积的密度；例如只落在一条曲线上的向量就可能如此。
+
+若分布对 Lebesgue 体积绝对连续，则存在非负函数 $p$ 满足
+\begin{equation}
+ P(X\in A)=\int_Ap(x)\dd x,\qquad\int_{\R^d}p(x)\dd x=1.
+\end{equation}
+$p(x)$ 不是单点概率。连续变量满足 $P(X=x)=0$，但其附近小区域的概率可以为正。在同一维度和同一坐标尺度下，密度越大，一小块等体积区域的概率通常越大。换坐标会改变体积单位，因而改变密度数值。
+
+实际数字图像有有限精度，原本是离散分布。为应用连续模型，可以归一化像素并作去量化，例如给整数像素加入区间均匀噪声。另一种处理是用连续模型的密度在像素量化区间上积分，得到离散概率。直接将一个连续密度值当成量化图像的概率质量，会把两种对象混在一起。严格报告 bits/dim 时还须明确去量化方式与尺度修正。
+
+\section{联合、条件、边缘与贝叶斯公式}
+两个随机变量的联合密度 $p(x,y)$ 同时描述二者。边缘密度通过积分获得：$p(x)=\int p(x,y)\dd y$。当 $p(y)>0$ 时，条件密度是 $p(x\mid y)=p(x,y)/p(y)$。于是
+\begin{equation}
+ p(x\mid y)=\frac{p(y\mid x)p(x)}{p(y)}.
+\end{equation}
+这是贝叶斯公式。扩散中 $p(y\mid x)$ 是已知的加噪核，$p(x)$ 是数据分布，$p(x\mid y)$ 则描述哪些原图可能导致当前含噪观测。
+
+这里容易出现一种误解：训练时我们知道“这个 $y$ 是由哪张 $x$ 生成的”，不代表仅给定 $y$ 就能在数学上唯一识别 $x$。训练配对提供一个条件后验的随机样本；网络只能根据输入可用的信息作预测。
+
+条件期望 $\E[V\mid U]$ 本身是 $U$ 的函数。它满足塔式法则
+\begin{equation}
+ \E[V]=\E\bigl[\E[V\mid U]\bigr].
+\end{equation}
+更一般地，对任何有界的 $U$ 的函数 $h$，或使下列相关乘积可积的 $h$，
+\begin{equation}
+ \E[h(U)V]=\E[h(U)\E[V\mid U]].
+\end{equation}
+正文多次使用的“把条件标签平均成边缘对象”正是这个法则的向量版本。需要平方回归时还要求相关变量二阶可积。
+
+\section{平方回归为什么得到条件均值}
+令 $m(U)=\E[V\mid U]$，展开平方：
+\begin{align}
+ \norm{h(U)-V}^2=&\norm{h(U)-m(U)}^2+\norm{m(U)-V}^2\\
+ &+2\ip{h(U)-m(U)}{m(U)-V}.
+\end{align}
+给定 $U$ 时，交叉项的条件期望是零。所以平方风险分成“预测距离最优函数的误差”和“观察不到的随机性所造成的不可消除方差”。这不仅证明最优函数为条件均值，也解释了为什么最佳损失一般不等于零。
+
+如果监督是图像 $X$，条件平均可能把不同合法图像叠加成模糊图像。如果监督是局部速度或 score，平均并不会立即成为最终输出；它成为概率动力学里的场。任务的语义与损失的数学形式需要一起看，不能笼统地说“均方误差只能生成模糊图像”。
+
+\section{高斯向量与条件公式}
+若 $X\sim\N(m,C)$，其中 $C$ 正定，则
+\begin{equation}
+ p(x)=\frac{\exp[-\tfrac12(x-m)^\top C^{-1}(x-m)]}{(2\pi)^{d/2}\det(C)^{1/2}}.
+\end{equation}
+仿射变换 $AX+b$ 仍是高斯，均值为 $Am+b$，协方差为 $ACA^\top$。两个独立高斯之和仍是高斯，均值和协方差分别相加。仅仅“不相关”一般不足以保证独立；在联合高斯情况下，不相关等价于独立。
+
+对联合高斯
+\begin{equation}
+ \begin{bmatrix}X\\Y\end{bmatrix}\sim\N\left(
+ \begin{bmatrix}m_X\\m_Y\end{bmatrix},
+ \begin{bmatrix}C_{XX}&C_{XY}\\C_{YX}&C_{YY}\end{bmatrix}\right),
+\end{equation}
+若 $C_{YY}$ 可逆，则
+\begin{align}
+ \E[X\mid Y=y]&=m_X+C_{XY}C_{YY}^{-1}(y-m_Y),\\
+ \Cov(X\mid Y)&=C_{XX}-C_{XY}C_{YY}^{-1}C_{YX}.
+\end{align}
+一种证明方式是令 $R=X-m_X-C_{XY}C_{YY}^{-1}(Y-m_Y)$。直接计算 $\Cov(R,Y)=0$；联合高斯性使 $R$ 与 $Y$ 独立，因此上面给出条件均值与残差方差。DDPM 后验也可用这一公式求得，正文选择配方是为了让系数来源更清楚。
+
+\section{KL、似然与变分下界}
+KL 散度定义为
+\begin{equation}
+ \KL(q\Vert p)=\E_q\log\frac{q(X)}{p(X)}.
+\end{equation}
+它要求 $q$ 对 $p$ 绝对连续；若 $q$ 给某处正概率而 $p$ 给零概率，KL 可以是无穷。KL 非负，但通常不对称，也不满足三角不等式，不能称为一般意义上的距离。
+
+由 $-\log$ 的凸性，
+\begin{equation}
+ \KL(q\Vert p)=-\E_q\log\frac pq
+ \ge-\log\E_q\frac pq\ge0,
+\end{equation}
+在同支撑、规范化等常见条件下最后的期望为 $1$。等号只在两个分布几乎处处相等时成立。
+
+两个高斯的 KL 可以把对数密度相减并用二次型期望计算：
+\begin{align}
+ \KL(\N(m_q,C_q)\Vert\N(m_p,C_p))
+ =\tfrac12\bigl[&\tr(C_p^{-1}C_q)
+ +(m_p-m_q)^\top C_p^{-1}(m_p-m_q)\\
+ &-d+\log\tfrac{\det C_p}{\det C_q}\bigr].
+\end{align}
+这里的基本恒等式是 $\E[(X-m)^\top A(X-m)]=\tr(AC)$。它解释了正文中的均值误差系数与方差项。
+
+似然把参数看作可变对象，样本看作已观测数据：$\theta\mapsto p_\theta(x)$。最大似然训练最大化训练数据的平均对数似然。对真实分布而言，
+\begin{equation}
+ \E_{\pdata}[-\log p_\theta(X)]
+ =H(\pdata)+\KL(\pdata\Vert p_\theta),
+\end{equation}
+在这些量存在时，最小负对数似然等价于最小这个方向的 KL。
+
+若模型有隐藏变量 $Z$，令任意辅助条件密度 $q(z\mid x)$ 满足相关支撑条件，定义
+\begin{equation}
+ \mathrm{ELBO}(x)=\E_{q(z\mid x)}[\log p_\theta(x,z)-\log q(z\mid x)].
+\end{equation}
+利用 $p_\theta(x,z)=p_\theta(z\mid x)p_\theta(x)$，直接得到
+\begin{equation}
+ \log p_\theta(x)-\mathrm{ELBO}(x)
+ =\KL(q(z\mid x)\Vert p_\theta(z\mid x))\ge0.
+\end{equation}
+这展示了下界的松紧来源。DDPM 的隐藏变量是整条含噪轨迹，辅助分布是前向链；并不是在每个时刻单独创建一个无关的 VAE。
+
+\section{推前、耦合与最优输运}
+给定映射 $T$，令 $Y=T(Z)$。它的分布记为 $T_\#p_Z$，意思是
+\begin{equation}
+ P(Y\in A)=P(Z\in T^{-1}(A)).
+\end{equation}
+这叫推前分布。它不要求 $T$ 可逆。若 $T$ 可逆且光滑，则变化量公式为
+\begin{equation}
+ p_Y(y)=p_Z(T^{-1}(y))\left|\det\frac{\partial T^{-1}}{\partial y}\right|.
+\end{equation}
+因此 GAN 的确定性生成器也能推前随机噪声；其难点不是“确定性就不能随机”，而是训练与密度计算方式。
+
+耦合 $\pi(z,x)$ 是具有指定两个边缘的联合分布。相同的起点、终点分布可以存在许多耦合：随机配对、按距离配对、模型流产生的配对都可能不同。最优输运在这些耦合里最小化一个代价，例如
+\begin{equation}
+ \inf_{\pi\in\Pi(p_Z,p_X)}\E_\pi\norm{X-Z}^2.
+\end{equation}
+这个最小值是平方 Wasserstein-2 距离（要求有限二阶矩）。选择直线插值只是给某个耦合选路径；它本身不负责把耦合优化到全局最优。小批量最优配对也不自动等于整个数据分布的最优耦合。
+
+\section{熵、归一化与有限样本}
+离散熵是 $-\sum_xp(x)\log p(x)$；连续微分熵是 $-\int p(x)\log p(x)\dd x$。微分熵会随坐标缩放变化，甚至可以为负。扩散中“加噪增加不确定性”的直觉不意味着任意带漂移过程的微分熵都单调增加；漂移可能压缩空间。
+
+真实数据分布不是训练集的经验分布本身。经验分布是各样本位置上的点质量混合，常写 $\widehat p=\frac1n\sum_i\delta_{x_i}$。高斯平滑后它变成可微核密度；只要模型容量与优化允许，网络也可能记住这些样本的局部结构。去噪训练并没有在数学上禁止记忆。泛化还依赖数据、归纳偏置、正则化及训练规模。
+
+\chapter{连续动力学：ODE 与随机微积分入门}\label{app:stochastic}
+\section{ODE 是随时间变化的向量场}
+普通微分方程 $\dot x_t=v(x_t,t)$ 表示粒子当前位置的速度由场决定。初始条件 $x_0=z$ 选定一条轨迹。如果 $v$ 连续并在状态变量上局部 Lipschitz，就有局部存在唯一性；适当的增长控制可保证有限时间内不爆炸。更强的光滑条件使流映射对初始状态可微。
+
+Euler 方法 $x_{t+h}=x_t+h v(x_t,t)$ 用当前速度近似整段移动，局部截断误差通常为 $O(h^2)$、全局误差为 $O(h)$，前提是足够光滑并稳定。Heun 方法先预测下一点，再平均两个端点的速度，满足条件时有二阶全局精度。阶数描述渐近误差随步长变化的规律，不代表在任意粗步长或任意网络场下都更好。
+
+刚性粗略指不同方向或区域具有很不相同的变化时间尺度，迫使某些显式算法使用很小步长来保持稳定。生成模型低噪声端的场可能变得陡峭，强引导也可能放大场幅度或敏感性。不能仅凭“轨迹看起来平滑”排除数值困难。
+
+\section{布朗运动与 SDE 的含义}
+标准布朗运动 $W_t$ 从零开始，路径连续，独立增量满足 $W_t-W_s\sim\N(0,(t-s)I)$。路径连续不意味着可微；它几乎必然处处不能按普通方式求导。形式上的“白噪声” $\dot W$ 应理解为广义随机对象。
+
+SDE
+$\dd X_t=f(X_t,t)\dd t+G(X_t,t)\dd W_t$
+是积分方程的简写：
+\begin{equation}
+ X_t=X_0+\int_0^t f(X_r,r)\dd r+\int_0^t G(X_r,r)\dd W_r.
+\end{equation}
+正文使用 It\^o 随机积分，离散近似在每段左端取系数。对适应于过去信息、平方可积的系数，随机积分满足均值零与等距性质：
+\begin{equation}
+ \E\norm{\int_0^tG_r\dd W_r}^2
+ =\E\int_0^t\norm{G_r}_{F}^{2}\dd r.
+\end{equation}
+这里 Frobenius 范数的平方是矩阵所有元素平方和。It\^o 与 Stratonovich 是两种不同积分约定；若扩散系数依赖状态，漂移转换会出现额外修正。正文的 $g(t)I$ 不依赖状态，避免了该处歧义。
+
+\section{It\^o 二阶项从哪里来}
+对一维小增量 $\Delta X=f\Delta t+g\Delta W$，Taylor 展开为
+\begin{equation}
+ \Delta\varphi=\varphi'\Delta X+\tfrac12\varphi''(\Delta X)^2+\cdots.
+\end{equation}
+由于 $\Delta W$ 的标准差是 $\sqrt{\Delta t}$，$(\Delta W)^2$ 在累积意义上留下 $\Delta t$ 的贡献；$(\Delta t)^2$ 与 $\Delta t\Delta W$ 则是更高阶。于是得到 $\tfrac12g^2\varphi''\dd t$。多维情况用 Hessian 与 $GG^\top$ 收缩：
+\begin{align}
+ \dd\varphi(X_t,t)=&\left(\partial_t\varphi+f\cdot\grad\varphi
+ +\tfrac12\tr(GG^\top\nabla^2\varphi)\right)\dd t\\
+ &+(\grad\varphi)^\top G\dd W_t.
+\end{align}
+这是正文由 SDE 得到密度方程的基础。形式记忆法 $\dd W_i\dd W_j=\delta_{ij}\dd t$ 是对二次变差的简写，不能当成普通代数里每次随机增量平方恰等于时间的断言。
+
+\section{弱形式为何适合概率路径}
+如果密度或场不够光滑，逐点微分方程未必成立。我们改用测试函数积分来定义方程。对于连续性方程，弱形式为
+\begin{equation}
+ \frac{\dd}{\dd t}\E[\varphi(X_t)]
+ =\E[\grad\varphi(X_t)\cdot v_t(X_t)].
+\end{equation}
+它表达所有可观測平滑量的期望如何变化。流匹配对固定端点条件下的路径可能只是一个移动的点质量，但对测试函数作求导仍然有意义。再把端点混合，就得到边缘输运方程。这也是正文选择测试函数证明而不强行给每条直线写普通密度的原因。
+
+\section{哪些地方应保留小的正噪声端点}
+当真实数据严格位于低维集合上时，零噪声端的普通 score 可能不存在。即使数据有密度，$b(t)\to0$ 时的 $\epsilon/b(t)$ 也可能具有高方差，数值积分容易不稳定。实践中常只积分到 $t_{\min}>0$，再作去噪估计或解码。理论端点、训练抽样端点与采样端点应分别说明。
+

@@ -1,0 +1,102 @@
+% !TEX program = xelatex
+% Build: xelatex main; biber main; xelatex main; xelatex main.
+\documentclass[lang=cn,chinesefont=nofont,scheme=chinese,11pt,
+ color=blue,mode=fancy,device=pad,bibend=biber]{elegantbook}
+\input{book-style}
+\addbibresource{references.bib}
+\begin{document}
+\hypersetup{pageanchor=false}
+\begin{titlepage}
+\pagecolor{paper}\color{ink}
+\begin{tikzpicture}[remember picture,overlay]
+ \fill[ink] (current page.north west) rectangle ($(current page.north east)+(0,-7mm)$);
+ \draw[gold,line width=0.7pt] ($(current page.north west)+(20mm,-34mm)$) -- ($(current page.north east)+(-20mm,-34mm)$);
+ \begin{scope}[shift={($(current page.center)+(0,-24mm)$)},scale=1.1]
+  \foreach \i in {0,...,35}{
+   \pgfmathsetmacro{\px}{-5+mod(\i*17,31)/31*3}
+   \pgfmathsetmacro{\py}{-1.5+mod(\i*11,37)/37*3}
+   \fill[teal!45] (\px,\py) circle (1.3pt);
+  }
+  \foreach \i in {0,...,20}{
+   \pgfmathsetmacro{\ang}{\i*17}
+   \draw[teal!25,thin] ({-2+0.07*\i},{-1.1+0.1*mod(\i*7,21)})
+    .. controls (0,{-1+0.1*\i}) and (1.3,{1.3*sin(\ang)}) .. ({3.3+0.85*cos(\ang)},{1.1*sin(\ang)});
+   \fill[teal] ({3.3+0.85*cos(\ang)},{1.1*sin(\ang)}) circle (1.5pt);
+  }
+  \node[font=\small,text=ink] at (-3.9,-2.1) {简单的噪声};
+  \node[font=\small,text=ink] at (3.3,-2.1) {有结构的分布};
+ \end{scope}
+\end{tikzpicture}
+\vspace*{38mm}
+{\sffamily\fontsize{34}{42}\selectfont\bfseries 扩散模型\par}
+\vspace{8mm}
+{\sffamily\Large 从分布直觉到多模态生成\par}
+\vspace{6mm}
+{\large Diffusion Models\par}
+\vfill
+{\color{teal}\rule{28mm}{1pt}\par}
+\vspace{5mm}
+{\large 概念\quad 数学\quad 方法\quad 应用\par}
+\vspace{3mm}
+{\small 面向熟悉数学分析、线性代数与机器学习的读者\par}
+\vspace{12mm}
+{\small 2026 年 10 月 9 日\quad 第一版\par}
+\end{titlepage}
+\nopagecolor\color{black}
+\hypersetup{pageanchor=true}
+\frontmatter
+\chapter*{写在前面}
+\addcontentsline{toc}{chapter}{写在前面}
+这本书想回答一个看似朴素的问题：怎样让一团随机数逐渐成为一幅有意义的图像？答案并不是把某张原图藏进噪声，再把它找出来。我们要学习一个分布，以及把简单分布变成复杂分布的规律。图像只是最直观的入口；相同思想还可以用于视频、音频、三维结构和其他数据。
+
+本书假定你知道导数、积分、矩阵、条件概率和神经网络的基本训练方式。但“知道数学”与“熟悉某篇论文的语言”是两回事。我们会解释重要术语，交代每个公式为何出现，再把它们连接到可实现的方法。随机微积分不是阅读前提；第二章需要的内容会从有限步直觉开始，并链接到附录。
+
+\begin{keybox}{四章是一条连续的理解路线}
+第一章建立分布、几何和去噪的直觉。第二章沿着可计算的高斯过程，推导 DDPM、score、反向 SDE、概率流 ODE 和速度场。第三章区分概率路径、训练目标、求解器与网络，解释主要方法为何演进。第四章把数学接回真实系统，从 U-Net 与隐空间走到 DiT、视频和统一多模态生成。
+\end{keybox}
+
+你可以顺序阅读，也可以先读第一章、第三章的算法框架和第四章的网络图，再回到第二章补齐证明。若只想掌握核心数学，重点读第二章的前向边缘、ELBO、去噪 score matching、概率流和条件流匹配。附录中的术语表是一个可随时跳转的工具；正文的青绿色术语、章节编号、公式编号和参考文献均可点击。大多数 PDF 阅读器可以用“返回上一视图”回到跳转前的位置。
+
+为了减少不必要的困难，全书把连续扩散的时间 $t$ 固定为“数据到噪声”，把流匹配的时间 $\tau$ 固定为“噪声到数据”。这个约定与部分论文不同。我们宁可反复标注时间方向，也不让一个负号把整个理解颠倒。第二章篇幅较长，是因为这里既要展示答案，也要展示答案为什么成立。
+
+本书不是论文摘要的拼接。历史事实和特定方法归属引向原始论文；例子、推导的组织方式与教学图为本书撰写。我们会把等式所需的假设、理想极限与实际误差分开：理论上的精确 score 不等于训练出的神经网络，连续时间的同边缘分布不等于有限步采样完全相同，条件插值直线也不意味着学到的整体轨迹一定是直线。
+
+第四章的文献核查截至 2026 年 10 月 9 日。它选取对理解技术路线有帮助的代表，而不声称覆盖所有当日新工作。论文、预印本、官方技术报告和产品披露具有不同的信息边界；未公开的架构不作猜测。未来方向是从已知瓶颈出发的判断，不能当成已经实现的能力。
+
+版式基于 ElegantBook v4.7，保留其原始类文件和 LPPL 1.3c 或更新版本的许可证；本书另行定制了电子书页幅、墨青色章节、留白和可跨页的教学框。模板来源：\href{https://github.com/ElegantLaTeX/ElegantBook}{ElegantLaTeX/ElegantBook}。所有论文链接集中在参考文献，可从正文直接进入。
+\tableofcontents
+\chapter*{符号与时间速查}
+\addcontentsline{toc}{chapter}{符号与时间速查}
+\begin{longtable}{p{30mm}p{108mm}}
+\toprule 符号 & 本书含义\\\midrule\endhead
+$x_0, X$ & 数据样本；大写常用于随机变量或流匹配端点。\\
+$x_k,\ K$ & 离散 DDPM 的第 $k$ 个含噪样本及总步数。\\
+$\beta_k,\alpha_k$ & 单步噪声方差，$\alpha_k=1-\beta_k$。\\
+$\bar\alpha_k$ & 累计信号保留量 $\prod_{j=1}^k\alpha_j$。\\
+$t\in[0,1]$ & 连续扩散：$t=0$ 为数据，$t=1$ 为高噪声端；生成向时间减小的方向积分。\\
+$a(t),b(t)$ & 表示 $x_t=a(t)x_0+b(t)\epsilon$ 的信号、噪声系数。\\
+$\epsilon,Z$ & 标准高斯噪声；流匹配用 $Z$ 表示起点。\\
+$p_t(x),s_t(x)$ & 时刻 $t$ 的边缘密度与 score，$s_t=\nabla_x\log p_t$。\\
+$f(x,t),g(t)$ & SDE 的漂移与各向同性扩散强度。\\
+$v_t^{\mathrm{PF}}$ & 扩散时间下的概率流 ODE 速度。\\
+$v=a\epsilon-bx_0$ & VP 路径常用的网络预测目标，须与实际时间导数区分。\\
+$\tau\in[0,1]$ & 流匹配：$\tau=0$ 为噪声，$\tau=1$ 为数据。\\
+$Y_\tau,u_\tau$ & 流匹配的插值随机变量与边缘速度。\\
+$c,\theta,d$ & 条件信息、神经网络参数与数据向量维数。\\
+$q,p_\theta$ & DDPM 已知前向过程与学得的反向生成过程。\\
+$\E,\KL,\norm{x}$ & 期望、KL 散度、欧氏范数。\\
+\bottomrule
+\end{longtable}
+\mainmatter
+\IfFileExists{chapters/01-concepts.tex}{\input{chapters/01-concepts}}{}
+\IfFileExists{chapters/02-math.tex}{\input{chapters/02-math}}{}
+\IfFileExists{chapters/03-methods.tex}{\input{chapters/03-methods}}{}
+\IfFileExists{chapters/04-applications.tex}{\input{chapters/04-applications}}{}
+\appendix
+\IfFileExists{appendices/01-foundations.tex}{\input{appendices/01-foundations}}{}
+\IfFileExists{appendices/02-proofs.tex}{\input{appendices/02-proofs}}{}
+\IfFileExists{appendices/03-glossary.tex}{\input{appendices/03-glossary}}{}
+\IfFileExists{appendices/04-reading.tex}{\input{appendices/04-reading}}{}
+\backmatter
+\printbibliography[heading=bibintoc,title={参考文献与原始论文}]
+\end{document}

@@ -1,0 +1,98 @@
+% Original ebook customization on the unmodified ElegantBook v4.7 class.
+% Template: https://github.com/ElegantLaTeX/ElegantBook (LPPL 1.3c+).
+\usepackage{mathtools,tabularx,longtable,array,ragged2e}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{arrows.meta,positioning,calc,shapes.geometric,fit,decorations.pathreplacing}
+\usepackage{bookmark}
+\usepackage[nameinlink,noabbrev]{cleveref}
+\geometry{paperwidth=190mm,paperheight=250mm,left=20mm,right=20mm,
+ top=21mm,bottom=22mm,headheight=16pt,headsep=7mm,footskip=11mm}
+\newif\ifbookwindowsfonts
+\bookwindowsfontsfalse
+\IfFontExistsTF{SimSun}{
+ \IfFontExistsTF{Microsoft YaHei}{
+  \IfFontExistsTF{KaiTi}{\bookwindowsfontstrue}{}
+ }{}
+}{}
+\ifbookwindowsfonts
+ \setCJKmainfont[BoldFont=Microsoft YaHei,ItalicFont=KaiTi]{SimSun}
+ \setCJKsansfont{Microsoft YaHei}
+ \setCJKmonofont{Microsoft YaHei}
+\else
+ \setCJKmainfont[BoldFont=FandolSong-Bold,ItalicFont=FandolKai-Regular]{FandolSong-Regular}
+ \setCJKsansfont[BoldFont=FandolHei-Bold]{FandolHei-Regular}
+ \setCJKmonofont{FandolFang-Regular}
+\fi
+\definecolor{ink}{HTML}{203C44}
+\definecolor{teal}{HTML}{276A73}
+\definecolor{gold}{HTML}{A87934}
+\definecolor{paper}{HTML}{FAF8F2}
+\colorlet{structurecolor}{ink}
+\colorlet{main}{teal}
+\colorlet{second}{gold}
+\colorlet{third}{teal}
+\hypersetup{pdftitle={扩散模型：从分布直觉到多模态生成},
+ pdfauthor={扩散模型学习手册},pdfsubject={DDPM、score、SDE、概率流、Flow Matching 与多模态生成},
+ pdfkeywords={Diffusion Models,DDPM,Flow Matching,DiT,中文教材},
+ linkcolor=teal,citecolor=teal,urlcolor=teal,bookmarksopenlevel=1,
+ pdfpagelayout=OneColumn,pdfstartview=FitH}
+\setcounter{tocdepth}{1}
+\setcounter{secnumdepth}{2}
+\setstretch{1.32}
+\setlength{\parskip}{3pt plus 1pt}
+\setlength{\emergencystretch}{2em}
+\raggedbottom
+\allowdisplaybreaks[2]
+\AtBeginDocument{\setlength{\abovedisplayskip}{9pt plus 2pt minus 2pt}
+ \setlength{\belowdisplayskip}{9pt plus 2pt minus 2pt}}
+\setlist[itemize]{leftmargin=2em,itemsep=3pt,topsep=5pt}
+\setlist[enumerate]{leftmargin=2em,itemsep=3pt,topsep=5pt}
+\renewcommand{\arraystretch}{1.2}
+\newcolumntype{Y}{>{\RaggedRight\arraybackslash}X}
+\fancyhf{}
+\fancyhead[L]{\small\color{ink}扩散模型}
+\fancyhead[R]{\small\color{ink}\nouppercase{\rightmark}}
+\fancyfoot[C]{\small\color{ink}\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\small\color{ink}\thepage}
+ \renewcommand{\headrulewidth}{0pt}\renewcommand{\headrule}{}}
+\tcbset{bookbox/.style={enhanced,breakable,sharp corners,
+ boxrule=0pt,borderline west={1.4pt}{0pt}{teal},colback=teal!4,
+ colframe=teal,coltitle=ink,colbacktitle=teal!7,
+ fonttitle=\sffamily\bfseries,fontupper=\normalfont,
+ left=10pt,right=10pt,top=7pt,bottom=7pt,before skip=10pt,after skip=10pt}}
+\newtcolorbox{intuitionbox}[1]{bookbox,title={直觉\quad #1}}
+\newtcolorbox{keybox}[1]{bookbox,title={要点\quad #1}}
+\newtcolorbox{cautionbox}[1]{bookbox,borderline west={1.4pt}{0pt}{gold},colback=gold!5,title={辨析\quad #1}}
+\newtcolorbox{examplebox}[2][]{bookbox,title={例子\quad #2},#1}
+\newtcolorbox{derivationbox}[1]{bookbox,title={推导\quad #1}}
+\newtcolorbox{exercisebox}[1]{bookbox,colback=black!2,title={练习\quad #1}}
+\newcommand{\readingguide}[1]{\begin{keybox}{本章阅读路线}#1\end{keybox}}
+\newcommand{\chaptertakeaway}[1]{\begin{keybox}{带走的理解}#1\end{keybox}}
+\newcommand{\term}[2]{\hyperref[#2]{\textcolor{teal}{#1}}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathcal{N}}
+\DeclareMathOperator{\KL}{KL}
+\newcommand{\dd}{\mathop{}\!\mathrm{d}}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\ip}[2]{\left\langle#1,#2\right\rangle}
+\newcommand{\pdata}{p_{\mathrm{data}}}
+\newcommand{\pnoise}{p_{\mathrm{noise}}}
+\newcommand{\score}{s}
+\newcommand{\eps}{\epsilon}
+\newcommand{\vtheta}{v_\theta}
+\newcommand{\utheta}{u_\theta}
+\newcommand{\grad}{\nabla}
+\DeclareMathOperator{\divg}{div}
+\DeclareMathOperator{\tr}{tr}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\Cov}{Cov}
+\DeclareMathOperator{\SNR}{SNR}
+\DeclareMathOperator{\argmin}{arg\,min}
+\crefname{chapter}{章}{章}\crefname{section}{节}{节}
+\crefname{equation}{式}{式}\crefname{figure}{图}{图}\crefname{table}{表}{表}
+\ExecuteBibliographyOptions{sorting=none,maxbibnames=6,maxcitenames=2,doi=false,isbn=false,eprint=false}
+\setlength{\bibitemsep}{7pt}
+\AtEveryBibitem{\clearfield{urlday}\clearfield{urlmonth}\clearfield{urlyear}}
